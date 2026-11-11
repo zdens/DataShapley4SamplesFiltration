@@ -1,0 +1,1202 @@
+---
+title: "Shapley values with Tumor Cell Percentage full dataset"
+subtitle: "RandomForest modeling"
+author: Denis Zavorotnyuk
+date: '`r format(Sys.time(), "%d-%m-%Y")`'
+output:
+  beamer_presentation:
+    slide_level: 2
+    theme: "AnnArbor"
+    colortheme: "dolphin"
+params:
+  format: !r if(opts_knit$get("rmarkdown.pandoc.to") == 'html') c('screen', 'print')
+    else 'print'
+  version: !r if(nchar(Sys.which("git"))) system("git describe --long --dirty --abbrev=10  --tags  --always",
+    intern=TRUE) else date()
+  options: !r list(
+                overwrite = TRUE,
+                work_dir = getwd()
+                )
+bibliography: '`r file.path(params$options$run_dir, "Shapley value for mislabling.bib")`'
+csl: '`r file.path(params$options$run_dir, "elseiver_vancouver.csl")`'
+header-includes:
+- \usepackage[T2A]{fontenc}
+- \usepackage[utf8]{inputenc}
+- \usepackage[english,russian]{babel}
+- \usepackage{grffile}
+- \usepackage{array}
+- \usepackage{pdflscape}
+- \usepackage{rotating}
+- \usepackage{caption}
+- \usepackage{longtable}
+- \usepackage{lscape}
+- \usepackage{float}
+- \usepackage{hyperref}
+- \usepackage{breakurl}
+- \usepackage{makecell}
+- \floatplacement{figure}{H}
+- \newcommand\Fontvi{\fontsize{4}{5.2}\selectfont}
+- \captionsetup{font=tiny}
+- \captionsetup[table]{labelformat=empty}
+- \hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    }
+---
+
+```{r loadPackages, include=FALSE, cache=FALSE}
+## load additional packages in this chunk
+library(pander)
+library(stringi)
+library(knitr)
+library(caret)
+library(sda)
+library(ggplot2)
+library(ggrepel)
+library(ggsci)
+library(ggpmisc)
+library(data.table)
+library(plyr)
+library(dplyr)
+library(xtable)
+library(RODBC)
+library(glmnet)
+library(kableExtra)
+library(latex2exp)
+library(patchwork)
+library(VennDiagram)
+library(randomForest)
+library(viridisLite)
+library(ggtext)
+
+
+opts_chunk$set(echo = FALSE)
+opts_chunk$set(warning = FALSE)
+opts_chunk$set(cache = FALSE)
+```
+
+```{r queries, include=FALSE}
+## ==================== SQL queries ====================##
+
+getDeviceQ <- "SELECT * FROM device where id = "
+getModeQ <- "select * from mode where id = "
+getResolution <- "select * from resolution where id = "
+getRange <- "select * from mzrange where id = "
+getExperimetnTypeQ <- "select * from exptype where id = "
+getDiagQ <- "select * from diagnosis where id = "
+get_tissue_query <- paste(
+  "select s.id, smpl.label as \"sample\", t.label as tissue,",
+  "s.exptype from spectrum s",
+  "join smpl smpl on s.sampleid = smpl.id ",
+  "join tissue t on smpl.tumorid = t.id where s.id in ("
+)
+```
+
+```{r functions, include=FALSE, cache=FALSE}
+scientific_10 <- function(x) {
+  # browser()
+  # cat("X: ", x, "\n")
+  y <- gsub("e-0", "e-", format(x, scientific = TRUE, trim = TRUE))
+  y <- gsub("e\\+0", "e", y)
+  text_labs <- gsub("e", " %*% 10^\"", paste0(y, "\""))
+  # text_labs <- gsub("e", " %*% 10^", scales::math_format()(x))
+  zeros <- stri_startswith_fixed(text_labs, pattern = "0 %")
+  text_labs[which(zeros)] <- "0"
+  zeros <- stri_startswith_fixed(text_labs, pattern = "0.0 %")
+  text_labs[which(zeros)] <- "0"
+  na_s <- stri_startswith_fixed(text_labs, pattern = "NA")
+
+  text_labs[which(na_s)] <- "NA"
+  str2expression(text_labs)
+}
+
+get_acquisition_params <- function(path, outfile = stderr()) {
+  ds_params <- stringi::stri_split_regex(basename(path), pattern = "\\.")[[1]]
+  if (length(ds_params) < 5) {
+    cat(
+      "Failed to obtain acquisition parameters from the path given!\n",
+      file = outfile
+    )
+    NULL
+  }
+  ds_expt <- as.numeric(stringi::stri_split_regex(
+    ds_params[[1]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  ds_res <- as.numeric(stringi::stri_split_regex(
+    ds_params[[2]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  ds_mode <- as.numeric(stringi::stri_split_regex(
+    ds_params[[3]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  ds_dev <- as.integer(stringi::stri_split_regex(
+    ds_params[[4]],
+    pattern = "[\\D]+"
+  )[[1]])
+  ds_dev <- ds_dev[which(!is.na(ds_dev))]
+  ds_range <- as.numeric(stringi::stri_split_regex(
+    ds_params[[5]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  list(
+    expt_id = ds_expt,
+    resol_id = ds_res,
+    pol_id = ds_mode,
+    dev_id = ds_dev,
+    mzrange_id = ds_range
+  )
+}
+get_mass_list <- function(mass, tolerance) {
+  all_mass <- sort(mass)
+  all_mass_idx <- which(all_mass >= 500 & all_mass <= 1000)
+  all_mass <- round(
+    all_mass[all_mass_idx],
+    digits = abs(floor(log10(tolerance)))
+  )
+  duplicated_idx <- which(duplicated(all_mass))
+  if (length(duplicated_idx) > 0) {
+    all_mass[-duplicated_idx]
+  } else {
+    all_mass
+  }
+}
+
+```
+
+# Задача
+
+Задача заключается в определении того, как соотносятся между собой значения элементов вектора Шепли с данными о количестве опухолевых клеток в образцах.
+
+Здесь половине строк матрицы интенсивностей, относящихся образцам с TCP = 100% и TCP = 0%, изменены метки классов на противоложные.
+
+## Материалы и методы {.small}
+
+```{r oblig.par}
+dbname <- dbname
+usr <- usr
+pwd <- pwd
+host <- host
+storage_url <- storage_url
+limp_bd_ggl <- limp_bd_ggl
+
+if (!("params" %in% ls())) {
+  params <- list(
+    options = list(
+      overwrite = TRUE,
+      work_dir = "data/diag_6_32/expt_1.res_1.mode_1.dev_2.mz_2"
+    )
+  )
+}
+
+acq_params <- get_acquisition_params(params$options$work_dir)
+
+if (is.null(acq_params)) {
+  acq_params <- list(
+    expt_id = 1,
+    resol_id = 1,
+    pol_id = 1,
+    dev_id = 2,
+    mzrange_id = 2
+  )
+}
+
+data_root_path <- params$options$work_dir
+options <- params$options
+options$target_diag <- 6
+options$base_diag <- 32
+options$base <- "Brain"
+log_file <- file.path(
+  options$work_dir,
+  "log_file.txt"
+)
+log_file_shap <- file.path(
+  options$work_dir,
+  "log_file_shapley.txt"
+)
+cat(
+  "====\tStarted at ",
+  format(Sys.time(), "%Y.%m.%d.%H_%M_%S"),
+  "\t====\n",
+  "R_HOME: ", Sys.getenv("R_HOME"), "\n",
+  file = log_file,
+  append = TRUE
+)
+```
+
+```{r db.connect, eval=TRUE}
+conn <- RODBC::odbcDriverConnect(
+  paste0(
+    "driver=MonetDB;server=",
+    host,
+    ";database=", dbname,
+    ";uid=", usr,
+    ";pwd=", pwd
+  )
+)
+```
+
+```{r input.params}
+diags_info <- rbind(
+  sqlQuery(conn, paste0(getDiagQ, options$target_diag)),
+  sqlQuery(conn, paste0(getDiagQ, options$base_diag))
+)
+if (options$base_diag == 32) {
+  diags_info$description[[2]] <- "Quasi-healthy brain"
+}
+```
+
+В работе используются масс-спектрометрические данные, полученные с образцов тканей головного мозга человека с диагнозами \textbf{`r diags_info$name[[1]]`} и патологии не-опухолевой природы. Данные были получены с помощью масс-спектрометра Thermo LTQ XL Orbitrap ETD (Thermo Fisher Scientific; США) с картриджной ионизацией [@Pekov2021a; @bormotov_incorporation_2023].
+
+Предварительная обработка масс-спектрометрических данных производилась с использованием параметров, указанных в таблице \ref{tab:paramstable}. Значения параметров взяты из результатов работы по определению оптимальных значений параметров предварительной обработки [@zavorotnyuk_determining_2024].
+
+
+## Acquisition parameters
+
+::::: columns
+::: {.column width="50%"}
+```{r inputdevice}
+device.info <- sqlQuery(conn, paste0(getDeviceQ, acq_params$dev_id))
+kable(device.info, format = "latex", caption = "Device", row.names = FALSE, booktabs = TRUE) %>%
+  kable_styling(latex_options = c("scale_down"), font_size = 10) %>%
+  column_spec(4, width = "10em")
+```
+:::
+
+::: {.column width="50%"}
+```{r inputmode}
+mode.info <- sqlQuery(conn, paste0(getModeQ, acq_params$pol_id))
+kable(mode.info, format = "latex", caption = "Polarity", row.names = FALSE, booktabs = TRUE) %>%
+  kable_styling(latex_options = c("scale_down"), font_size = 6)
+```
+:::
+:::::
+
+::::: columns
+::: {.column width="50%"}
+```{r input.range}
+range.info <- sqlQuery(conn, paste0(getRange, acq_params$mzrange_id))
+kable(range.info, format = "latex", caption = "MZ range", row.names = FALSE, booktabs = TRUE) %>%
+  kable_styling(latex_options = c("scale_down"), font_size = 6)
+```
+:::
+
+::: {.column width="50%"}
+```{r inputresolution}
+resolution.info <- sqlQuery(conn, paste0(getResolution, acq_params$resol_id))
+kable(
+  resolution.info,
+  format = "latex", caption = "Resolution", row.names = FALSE, booktabs = TRUE
+) %>%
+  kable_styling(latex_options = c("scale_down"), font_size = 6)
+```
+:::
+:::::
+
+```{r loadata}
+shap_env <- new.env()
+shap_path <- options$work_dir
+tmp_files <- list.files(
+  file.path(shap_path, "temp_data"),
+  pattern = paste0(diags_info$id[[1]], "_", diags_info$id[[2]], "_tmp.RData")
+)
+tmp_files_info <- cbind(
+  tmp_files,
+  file.info(
+    file.path(shap_path, "temp_data", tmp_files)
+  )
+)
+fresh_file <- tmp_files_info[
+  order(tmp_files_info$mtime, decreasing = TRUE),
+][1,]
+cat(
+  "Read data from ",
+  file.path(
+    shap_path,
+    "temp_data",
+    fresh_file$tmp_files[[1]]
+  ), "\n",
+  file = log_file,
+  append = TRUE
+)
+load(
+  file.path(
+    shap_path,
+    "temp_data",
+    fresh_file$tmp_files[[1]]
+  ),
+  envir = shap_env
+)
+all_fm_data <- new.env()
+load(
+  file.path(
+    shap_path, "all_fm_data.RData"
+  ),
+  envir = all_fm_data
+)
+shap_env$train_test_data <- new.env()
+load(
+  file.path(shap_path, "train_test_set.Rdata"),
+  envir = shap_env$train_test_data
+)
+shap_env$smote_data <- new.env()
+load(
+  file.path(shap_path, "averaged_features.RData"),
+  envir = shap_env$smote_data
+)
+shap_env$cat.col.number <- ncol(shap_env$train_test_data$shap_train_set)
+shap_env$shap_calculated <- shap_env$phiLast
+
+shap_env$diags.info <- diags_info
+feature_matrix <- all_fm_data$full_fm
+tcp_data_file <- file.path(
+  options$work_dir,
+  "..","..","..",
+  "tcp_data.rds"
+)
+tcp_data_table <- readRDS(tcp_data_file)
+
+shap_env$shap_trained_mdT <- rbind(
+  all_fm_data$full_meta_data[
+    shap_env$train_test_data$shap_train_idx,
+  ],
+  all_fm_data$avg_meta_data
+)
+shap_env$shap_trained_mdT <- cbind(
+  shap_env$shap_trained_mdT,
+  shap_env$train_test_data$shap_train_set[, "class"]
+)
+ms_spectra <- readRDS(
+  file.path(
+    options$work_dir,
+    "ms_spectra.rds"
+  )
+)
+
+cat(
+  "loadata\tExisted FM params: ",
+  paste0(dim(shap_env$train_test_data$shap_train_set), collapse = "x"),
+  "\n",
+  file = log_file,
+  append = TRUE
+)
+```
+
+## Demography data
+
+::::: columns
+::: {.column width="50%"}
+```{r demograph}
+demogr_data <- all_fm_data$full_meta_data |>
+  select(tissue, diagnosis) |>
+  distinct() |>
+  mutate(
+    tissue = stri_replace_all_regex(tissue, "(\\s\\d)", "")
+  ) |> summarise(cnt = n(), .by = diagnosis)
+kable(
+  demogr_data,
+  format = "latex", caption = "Patients data",
+  row.names = FALSE, booktabs = TRUE
+) %>%
+  kable_styling(latex_options = c("scale_down"), font_size = 10)
+```
+:::
+
+::: {.column width="50%"}
+```{r tissuesstats}
+tissue_stat_data <- all_fm_data$result_meta_data |>
+  select(tsample, diagnosis) |>
+  filter(stri_count_fixed(tsample, "AVG") == 0) |>
+  distinct() |>
+  summarise(cnt = n(), .by = diagnosis)
+
+kable(
+  tissue_stat_data,
+  format = "latex", caption = "Tissues data",
+  row.names = FALSE, booktabs = TRUE
+) %>%
+  kable_styling(latex_options = c("scale_down"), font_size = 10)
+```
+:::
+:::::
+
+## DataShapley stats
+
+```{r shapleysummary,eval=TRUE}
+params_table <- cbind(
+  c(
+    "Tissue samples number", "Features number", "Iterations number",
+    "Negative Shapley-values part", "Shapley maximum value",
+    "Shapley minimum value", "Train set size", "Validating set size"
+  ),
+  c(
+    length(unique(shap_env$shap_trained_mdT$tsample)),
+    ncol(shap_env$train_test_data$shap_train_set) - 1,
+    shap_env$t,
+    paste(
+      format(
+        100 * length(
+          which(
+            shap_env$shap_calculated < 0
+          )
+        ) / length(shap_env$shap_calculated),
+        scientific = FALSE,
+        digits = 4
+      ),
+      "%"
+    ),
+    format(max(shap_env$shap_calculated),
+      scientific = TRUE,
+      digits = 4
+    ),
+    format(min(shap_env$shap_calculated),
+      scientific = TRUE,
+      digits = 4
+    ),
+    nrow(shap_env$train_test_data$shap_train_set),
+    nrow(shap_env$train_test_data$shap_test_set)
+  )
+)
+colnames(params_table) <- c("Parameter", "Value")
+kable(params_table,
+  format = "latex",
+  caption = "ShapleyData summary", row.names = FALSE,
+  booktabs = TRUE
+)
+```
+
+## Shapley calculated values distribution
+
+```{r shapqplots, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+shap_hist_df <- rbind(
+  data.frame(
+    shapley = shap_env$shap_calculated,
+    method = c("Calculated")
+  )
+)
+ggplot(shap_hist_df) +
+  geom_histogram(
+    aes(x = shapley),
+    binwidth = 1e-5,
+    stat = "bin",
+    fill = "skyblue"
+  ) +
+  scale_x_continuous(labels = scientific_10) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  labs(x = "Shapley values")
+```
+
+## Calculated Shapley-TCP Scatterplot
+
+```{r shaptcpscatter3, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+shap_diag_labels <- as.factor(shap_env$shap_trained_mdT$diagnosis)
+
+shap_samples_distr <- data.frame(
+  shap_value = shap_env$shap_calculated,
+  sample_labels = shap_env$shap_trained_mdT$tsample,
+  diag_label = shap_diag_labels,
+  class_label = shap_env$train_test_data$shap_train_set$class
+)
+shap_samples_distr <- shap_samples_distr |>
+  mutate(
+    Annotation = ifelse(diag_label == class_label, TRUE, FALSE)
+  )
+shap_samples_distr$Scan <- "RAW"
+shap_samples_distr$Scan[seq_len(nrow(all_fm_data$avg_meta_data)) + length(
+  shap_env$train_test_data$shap_train_idx
+)] <- "AVG"
+tcp_values <- shap_env$shap_trained_mdT$tcp
+shap_scans_df <- cbind(
+  shap_samples_distr,
+  tcp_values
+)
+ordered_calc_shap_tcp <- shap_scans_df[
+  with(shap_scans_df, order(tcp_values, sample_labels)),
+]
+ordered_calc_shap_tcp$sample_labels <- factor(
+  ordered_calc_shap_tcp$sample_labels,
+  levels = unique(ordered_calc_shap_tcp$sample_labels)
+)
+ggplot(
+  data = ordered_calc_shap_tcp,
+  aes(
+    x = shap_value, y = sample_labels, colour = tcp_values, shape = Annotation
+  )
+) +
+  facet_grid(Scan ~ class_label) +
+  geom_point() +
+  labs(
+    x = "Shapley value",
+    y = "Tissue samples",
+    colour = "TCP",
+    shape = "Annotation"
+  ) +
+  scale_x_continuous(labels = scientific_10) +
+  scale_y_discrete(guide = guide_axis(check.overlap = TRUE)) +
+  scale_shape(solid = FALSE) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.5, linetype = 2) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+  ) +
+  scale_colour_gsea()
+```
+
+## Calculated Shapley-TCP Density
+
+```{r shaptcpscatterdensity, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+ggplot(
+  data = ordered_calc_shap_tcp |>
+    filter(Scan == "AVG"),
+  aes(
+    x = shap_value, colour = Annotation
+  )
+) +
+  facet_grid(. ~ class_label) +
+  geom_density() +
+  labs(
+    x = "Shapley value",
+    colour = "Annotation"
+  ) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+  )
+```
+
+## Model training
+
+```{r modeltrain, cache=FALSE}
+tr_control <- trainControl(method = "repeatedcv", number = 5, repeats = 3)
+rf_model <- train(
+  shap_env$train_test_data$shap_train_set[, seq_len(ncol(
+    shap_env$train_test_data$shap_train_set
+  ) - 1)],
+  shap_env$shap_calculated,
+  #preProc = c("center", "scale"),
+  method = "rf",
+  trControl = tr_control,
+  importance = TRUE
+)
+saveRDS(
+  rf_model,
+  file = file.path(options$work_dir, "rf_model.rds")
+)
+print(rf_model)
+```
+
+## Prediction rank
+
+```{r predrank, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+predicted_shapley <- predict(rf_model$finalModel, all_fm_data$result_fm)
+my_formula <- y ~ x
+test_rank <- data.frame(
+  target = rank(
+    shap_env$shap_calculated[seq_len(
+      length(shap_env$train_test_data$shap_train_idx)
+    )]
+  ),
+  predict = rank(predicted_shapley[shap_env$train_test_data$shap_train_idx])
+)
+ggplot(data = test_rank, aes(x = target, y = predict)) +
+  geom_smooth(method = "lm", se=FALSE, color="black", formula = my_formula) +
+  stat_poly_eq(
+    formula = my_formula,
+    eq.with.lhs = "italic(hat(y))~`=`~",
+    aes(label = paste(
+      after_stat(eq.label),
+      after_stat(rr.label),
+      sep = "*plain(\",\")~"
+    )),
+    parse = TRUE
+  ) +
+  geom_point() +
+  geom_jitter() +
+  labs(
+    x = "Target Shapley values",
+    y = "Predicted Shapley values",
+    title = "Rank-Rank plot"
+  ) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+  )
+
+```
+
+## Full dataset scatterplot
+
+```{r fullscatterplot, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+shap_samples_distr_full <- data.frame(
+  shap_value = unlist(predicted_shapley),
+  sample_labels = all_fm_data$result_meta_data$tsample,
+  diag_label = as.factor(
+    ifelse(
+      all_fm_data$result_meta_data$diagnosis == 6,
+      "Glioblastoma",
+      "Unmodified"
+    )
+  ),
+  tcp_values = all_fm_data$result_meta_data$tcp
+)
+ordered_calc_shap_tcp <- shap_samples_distr_full[
+  with(shap_samples_distr_full, order(tcp_values, sample_labels)),
+]
+ordered_calc_shap_tcp$sample_labels <- factor(
+  ordered_calc_shap_tcp$sample_labels,
+  levels = unique(ordered_calc_shap_tcp$sample_labels)
+)
+ggplot(
+  data = ordered_calc_shap_tcp,
+  aes(
+    x = shap_value, y = sample_labels, colour = tcp_values
+  )
+) +
+  # facet_grid(diag_label ~ .) +
+  geom_point() +
+  labs(
+    x = "Shapley value",
+    y = "Tissue samples",
+    colour = "TCP"
+  ) +
+  scale_x_continuous(labels = scientific_10) +
+  scale_y_discrete(guide = guide_axis(check.overlap = TRUE)) +
+  scale_shape(solid = FALSE) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.5, linetype = 2) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+  ) +
+  scale_colour_gsea()
+```
+
+## Full dataset scatterplot 2
+```{r fullscatterplot2, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+
+avoid_overlapling <- function(x) {
+  idx <- seq.int(1, length(x), by = 3)
+  x[-idx] <- ""
+  x
+}
+
+tsamples_parts <- ldply(
+  stringi::stri_match_all_regex(
+    shap_samples_distr_full$sample_labels,
+    pattern = "(?<tissue>\\d+\\/\\d+)(?:\\s(?<species>\\d))?-(?<sample>\\d+)"
+  ),
+  function(x) {
+    as.data.frame(x)
+  }
+)[, c("tissue", "species", "sample")]
+tissues <- unique(tsamples_parts$tissue)
+tsamples_parts$tfact <- factor(
+  tsamples_parts$tissue,
+  labels = paste("PAT", sprintf("%02d", seq_along(tissues)), sep = "")
+)
+colors_22 <- scales::hue_pal()(
+  max(
+    length(tissues), length(unique(tsamples_parts$species))
+  )
+)
+tsamples_parts <- tsamples_parts |>
+  mutate(
+    spec_fact = as.factor(dplyr::if_else(
+      is.na(species), " A ", paste0(" ", LETTERS[as.numeric(species)], " ")
+    ))
+  )
+tsamples_parts <- tsamples_parts |>
+  mutate(
+    sample_label3 = paste(
+      "<span style='color:",
+      colors_22[tfact], "'>",
+      tfact, "</span>",
+      "<span style='color:",
+      colors_22[spec_fact], "'>",
+      spec_fact, "</span>",
+      "<span style='color:",
+      colors_22[as.numeric(sample)], "'>",
+      sample, "</span>",
+      sep = ""
+    ),
+    sample_label2 = paste(
+      tfact,
+      spec_fact,
+      sample,
+      sep = ""
+    )
+  )
+shap_samples_distr_full$sample_labels2 <- tsamples_parts$sample_label2
+shap_samples_distr_full$sample_labels3 <- tsamples_parts$sample_label3
+idx <- sort(shap_samples_distr_full$tcp_values, index.return = TRUE)
+
+ordered_calc_shap_tcp <- shap_samples_distr_full[idx$ix,]
+ordered_calc_shap_tcp$sample_labels2 <- factor(
+  ordered_calc_shap_tcp$sample_labels2,
+  levels = unique(ordered_calc_shap_tcp$sample_labels2)
+)
+ggplot(
+  data = ordered_calc_shap_tcp,
+  aes(
+    x = shap_value, y = sample_labels2, colour = tcp_values, shape = diag_label
+  )
+) +
+  geom_point() +
+  labs(
+    x = "Shapley value",
+    y = "Tissue samples",
+    colour = "TCP",
+    shape = "Diagnosis"
+  ) +
+  scale_x_continuous(labels = scientific_10) +
+  scale_y_discrete(labels = avoid_overlapling) +
+  scale_shape(solid = FALSE) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.5, linetype = 2) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right"
+  ) +
+  scale_colour_gsea()
+```
+
+```{r fullscatterplot222, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+label_samples <- function(x) {
+  # browser()
+  # cat("X: ", x, "\n")?
+  tsamples_parts <- ldply(
+    stringi::stri_match_all_regex(
+      x,
+      pattern = "(?<tissue>\\d+\\/\\d+)(?:\\s(?<species>\\d))?-(?<sample>\\d+)"
+    ),
+    function(x) {
+      as.data.frame(x)
+    }
+  )[, c("tissue", "species", "sample")]
+  tissues <- unique(tsamples_parts$tissue)
+  tsamples_parts$tfact <- factor(
+    tsamples_parts$tissue,
+    labels = paste("PAT", sprintf("%02d", seq_along(tissues)), sep = "")
+  )
+  colors_22 <- scales::hue_pal()(
+    max(
+      length(tissues), length(unique(tsamples_parts$species))
+    )
+  )
+  tsamples_parts <- tsamples_parts |>
+    mutate(
+      spec_fact = as.factor(dplyr::if_else(
+        is.na(species), " A ", paste0(" ", LETTERS[as.numeric(species)], " ")
+      ))
+    )
+  tsamples_parts <- tsamples_parts |>
+    mutate(
+      sample_label3 = paste(
+        "<span style='color:",
+        colors_22[tfact], "'>",
+        tfact, "</span>",
+        "<span style='color:",
+        colors_22[spec_fact], "'>",
+        spec_fact, "</span>",
+        "<span style='color:",
+        colors_22[as.numeric(sample)], "'>",
+        sample, "</span>",
+        sep = ""
+      ),
+      sample_label2 = paste(
+        tfact,
+        spec_fact,
+        sample,
+        sep = ""
+      )
+    )
+  idx <- seq.int(1, length(tsamples_parts$sample_label3), by = 3)
+  tsamples_parts$sample_label3[-idx] <- ""
+  tsamples_parts$sample_label3
+}
+ggplot(
+  data = ordered_calc_shap_tcp,
+  aes(
+    x = shap_value, y = sample_labels, colour = tcp_values, shape = diag_label
+  )
+) +
+  geom_point() +
+  labs(
+    x = "Shapley value",
+    y = "Tissue samples",
+    colour = "TCP",
+    shape = "Diagnosis"
+  ) +
+  scale_x_continuous(labels = scientific_10) +
+  # scale_y_discrete(guide = guide_axis(check.overlap = TRUE)) +
+  scale_y_discrete(labels = label_samples) +
+  scale_shape(solid = FALSE) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.5, linetype = 2) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+    axis.text.y = element_markdown()
+  ) +
+  scale_colour_gsea()
+```
+
+## Full height
+```{r fullheight, dev='cairo_pdf', fig.height=20, out.width="100%", cache=FALSE}
+label_samples_full <- function(x) {
+  tsamples_parts <- ldply(
+    stringi::stri_match_all_regex(
+      x,
+      pattern = "(?<tissue>\\d+\\/\\d+)(?:\\s(?<species>\\d))?-(?<sample>\\d+)"
+    ),
+    function(x) {
+      as.data.frame(x)
+    }
+  )[, c("tissue", "species", "sample")]
+  tissues <- unique(tsamples_parts$tissue)
+  tsamples_parts$tfact <- factor(
+    tsamples_parts$tissue,
+    labels = paste("PAT", sprintf("%02d", seq_along(tissues)), sep = "")
+  )
+  colors_22 <- scales::hue_pal()(
+    max(
+      length(tissues), length(unique(tsamples_parts$species))
+    )
+  )
+  tsamples_parts <- tsamples_parts |>
+    mutate(
+      spec_fact = as.factor(dplyr::if_else(
+        is.na(species), " A ", paste0(" ", LETTERS[as.numeric(species)], " ")
+      ))
+    )
+  tsamples_parts <- tsamples_parts |>
+    mutate(
+      sample_label3 = paste(
+        "<span style='color:",
+        colors_22[tfact], "'>",
+        tfact, "</span>",
+        "<span style='color:",
+        colors_22[spec_fact], "'>",
+        spec_fact, "</span>",
+        "<span style='color:",
+        colors_22[as.numeric(sample)], "'>",
+        sample, "</span>",
+        sep = ""
+      ),
+      sample_label2 = paste(
+        tfact,
+        spec_fact,
+        sample,
+        sep = ""
+      )
+    )
+  tsamples_parts$sample_label3
+}
+ordered_calc_shap_tcp <- shap_samples_distr_full[idx$ix,]
+ordered_calc_shap_tcp$sample_labels <- factor(
+  ordered_calc_shap_tcp$sample_labels,
+  levels = unique(ordered_calc_shap_tcp$sample_labels)
+)
+ggplot(ordered_calc_shap_tcp, aes(x = shap_value, y = sample_labels,
+                                  colour = tcp_values, shape = diag_label)) +
+  geom_point() +
+  scale_shape(solid = FALSE, name = "Diagnosis") +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.5, linetype = 2) +
+  scale_x_continuous(labels = scientific_10) +
+  scale_y_discrete(labels = label_samples_full) +
+  labs(x = "Shapley value", y = "Tissue samples") +
+  theme_bw(base_size = 14) +
+  theme(axis.text.y = element_markdown(),
+        legend.position = "right") +
+  scale_colour_gsea()
+```
+
+## Full dataset scatterplot 3
+```{r fullscatterplot3, dev='cairo_pdf', out.height="85%", out.width="95%", cache=FALSE}
+ggplot(
+  data = ordered_calc_shap_tcp,
+  aes(
+    x = shap_value, y = sample_labels, colour = tcp_values
+  )
+) +
+  facet_grid(diag_label ~ ., scale = "free_y") +
+  geom_point() +
+  labs(
+    x = "Shapley value",
+    y = "Tissue samples",
+    colour = "TCP"
+  ) +
+  scale_x_continuous(labels = scientific_10) +
+  scale_y_discrete(guide = guide_axis(check.overlap = TRUE)) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.5, linetype = 2) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+  ) +
+  scale_colour_gsea()
+```
+
+# Modeling with averaged data
+
+```{r avgdatamodel}
+true_idx <- which(
+  shap_samples_distr$Annotation == TRUE & shap_samples_distr$Scan == "AVG"
+)
+avg_data_idx <- seq_along(
+  shap_env$shap_calculated
+)[(
+  length(shap_env$train_test_data$shap_train_idx) + 1
+): length(shap_env$shap_calculated)
+]
+rf_model_avg <- train(
+  shap_env$train_test_data$shap_train_set[
+    true_idx, seq_len(ncol(
+      shap_env$train_test_data$shap_train_set
+    ) - 1)
+  ],
+  shap_env$shap_calculated[true_idx],
+  #preProc = c("center", "scale"),
+  method = "rf",
+  trControl = tr_control,
+  importance = TRUE
+)
+saveRDS(
+  rf_model_avg,
+  file = file.path(options$work_dir, "rf_model_avg.rds")
+)
+print(rf_model_avg)
+```
+
+## Prediction rank
+
+```{r predrankavg, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+predicted_shapley_avg <- predict(
+  rf_model_avg$finalModel, shap_env$train_test_data$shap_train_set
+)
+my_formula <- y ~ x
+test_rank <- data.frame(
+  target = rank(
+    shap_env$shap_calculated[true_idx]
+  ),
+  predict = rank(predicted_shapley_avg[true_idx])
+)
+ggplot(data = test_rank, aes(x = target, y = predict)) +
+  geom_smooth(method = "lm", se=FALSE, color="black", formula = my_formula) +
+  stat_poly_eq(
+    formula = my_formula,
+    eq.with.lhs = "italic(hat(y))~`=`~",
+    aes(label = paste(
+      after_stat(eq.label),
+      after_stat(rr.label),
+      sep = "*plain(\",\")~"
+    )),
+    parse = TRUE
+  ) +
+  geom_point() +
+  geom_jitter() +
+  labs(
+    x = "Target Shapley values",
+    y = "Predicted Shapley values",
+    title = "Rank-Rank plot on averaged data"
+  ) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+  )
+
+```
+
+## Prediction rank (Precentile)
+
+```{r predrankavgpercent, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+df_a <- data.frame(
+  shap_a = shap_env$shap_calculated, scan = shap_env$shap_trained_mdT$idx
+)
+df_b <- data.frame(
+  shap_b = predicted_shapley_avg[true_idx],
+  scan = shap_env$shap_trained_mdT$idx[true_idx]
+)
+
+merged_df <- inner_join(df_a, df_b, by = "scan")
+
+merged_df <- merged_df %>%
+  mutate(
+    Rank_A = percent_rank(shap_a),
+    Rank_B = percent_rank(shap_b)
+  )
+
+ggplot(merged_df, aes(x = shap_a, y = shap_b)) +
+  geom_point(alpha = 0.7, color = "blue") +
+  geom_smooth(method = "lm", se=FALSE, color="red",slope = 1, linetype = "dashed", formula = my_formula) +
+  stat_poly_eq(
+    formula = my_formula,
+    eq.with.lhs = "italic(hat(y))~`=`~",
+    aes(label = paste(
+      after_stat(eq.label),
+      after_stat(rr.label),
+      sep = "*plain(\",\")~"
+    )),
+    parse = TRUE
+  ) +
+  labs(
+    title = "Rank-Rank Plot (Percentile Ranks)",
+    x = "Rank in Calculated shapley (Percentile)",
+    y = "Rank in Predicted shapley (Percentile)"
+  ) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "none",
+  )
+
+```
+
+## Full dataset scatterplot
+
+```{r fullscatterplotavg, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+predicted_shapley_avg <- predict(
+  rf_model_avg$finalModel, all_fm_data$result_fm
+)
+shap_samples_distr_avg <- data.frame(
+  shap_value = unlist(predicted_shapley_avg),
+  sample_labels = all_fm_data$result_meta_data$tsample,
+  diag_label = as.factor(
+    ifelse(
+      all_fm_data$result_meta_data$diagnosis == 6,
+      "Glioblastoma",
+      "Unmodified"
+    )
+  ),
+  tcp_values = all_fm_data$result_meta_data$tcp
+)
+ordered_calc_shap_tcp_avg <- shap_samples_distr_avg[
+  with(shap_samples_distr_avg, order(tcp_values, sample_labels)),
+]
+ordered_calc_shap_tcp_avg$sample_labels <- factor(
+  ordered_calc_shap_tcp_avg$sample_labels,
+  levels = unique(ordered_calc_shap_tcp_avg$sample_labels)
+)
+ggplot(
+  data = ordered_calc_shap_tcp_avg,
+  aes(
+    x = shap_value, y = sample_labels, colour = tcp_values
+  )
+) +
+  # facet_grid(diag_label ~ .) +
+  geom_point() +
+  labs(
+    x = "Shapley value",
+    y = "Tissue samples",
+    colour = "TCP"
+  ) +
+  scale_x_continuous(labels = scientific_10) +
+  scale_y_discrete(guide = guide_axis(check.overlap = TRUE)) +
+  scale_shape(solid = FALSE) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.5, linetype = 2) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+  ) +
+  scale_colour_gsea()
+```
+
+## Full dataset scatterplot 2
+```{r fullscatterplot2avg, dev='cairo_pdf', out.height="85%", out.width="100%", cache=FALSE}
+ggplot(
+  data = ordered_calc_shap_tcp_avg,
+  aes(
+    x = shap_value, y = sample_labels, colour = tcp_values, shape = diag_label
+  )
+) +
+  geom_point() +
+  labs(
+    x = "Shapley value",
+    y = "Tissue samples",
+    colour = "TCP",
+    shape = "Diagnosis"
+  ) +
+  scale_x_continuous(labels = scientific_10) +
+  scale_y_discrete(guide = guide_axis(check.overlap = TRUE)) +
+  scale_shape(solid = FALSE) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.5, linetype = 2) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+  ) +
+  scale_colour_gsea()
+```
+
+## Full dataset scatterplot 3
+```{r fullscatterplot3avg, dev='cairo_pdf', out.height="85%", out.width="95%", cache=FALSE}
+ggplot(
+  data = ordered_calc_shap_tcp_avg,
+  aes(
+    x = shap_value, y = sample_labels, colour = tcp_values
+  )
+) +
+  facet_grid(diag_label ~ ., scale = "free_y") +
+  geom_point() +
+  labs(
+    x = "Shapley value",
+    y = "Tissue samples",
+    colour = "TCP"
+  ) +
+  scale_x_continuous(labels = scientific_10) +
+  scale_y_discrete(guide = guide_axis(check.overlap = TRUE)) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.5, linetype = 2) +
+  theme_bw(base_size = 14, base_family = "Helvetica") +
+  theme(
+    axis.text = element_text(size = 14),
+    strip.text = element_text(size = 14),
+    legend.position = "right",
+  ) +
+  scale_colour_gsea()
+```
+
+# Литература
+
+::: {#refs}
+:::
+
+# Appendix {.tabset}
+
+## Versions
+
+### Document version
+
+```{r docVersion, echo=FALSE, results='asis', cache=FALSE}
+cat(params$version)
+```
+
+### Session Info
+
+```{r sessionInfo, echo=FALSE, results='asis', class='text', warning=FALSE}
+pander(devtools::session_info()[[1]])
+cat("\n")
+pander(
+  as.data.frame(
+    devtools::session_info()[[2]][, c("loadedversion", "source", "date")]
+  )
+)
+```

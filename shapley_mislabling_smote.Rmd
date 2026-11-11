@@ -1,0 +1,701 @@
+---
+title: "Data Shapley modeling with SMOTE sampling"
+author: "Denis Zavorotnyuk"
+date: '`r format(Sys.time(), "%d.%m.%Y")`'
+output:
+  pdf_document:
+    keep_tex: yes
+    number_sections: yes
+  html_document: default
+params:
+  format: !r if(opts_knit$get("rmarkdown.pandoc.to") == 'html') c('screen', 'print')
+    else 'print'
+  version: !r if(nchar(Sys.which("git"))) system("git describe --long --dirty --abbrev=10  --tags  --always",
+    intern=TRUE) else date()
+  options: !r list(
+                overwrite = TRUE,
+                work_dir = getwd()
+                )
+bibliography: '`r file.path(params$options$run_dir, "Shapley value for mislabling.bib")`'
+csl: '`r file.path(params$options$run_dir, "elseiver_vancouver.csl")`'
+header-includes:
+- \usepackage[T2A]{fontenc}
+- \usepackage[utf8]{inputenc}
+- \usepackage[english,russian]{babel}
+- \usepackage{grffile}
+- \usepackage{rotating}
+- \usepackage{caption}
+- \usepackage{longtable}
+- \usepackage{lscape}
+- \usepackage{float}
+- \usepackage{hyperref}
+- \usepackage{breakurl}
+- \usepackage{makecell}
+- \hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    }
+---
+```{r loadPackages, include=FALSE, cache=FALSE}
+## load additional packages in this chunk
+library(pander)
+library(stringi)
+library(knitr)
+library(caret)
+library(sda)
+library(ggplot2)
+library(ggpmisc)
+library(data.table)
+library(plyr)
+library(dplyr)
+library(xtable)
+library(datasets)
+library(ShapleyDataR)
+library(ScansProcessor)
+library(glmnet)
+library(RODBC)
+library(kableExtra)
+library(latex2exp)
+library(patchwork)
+```
+
+```{r setup, include=FALSE, cache=FALSE}
+## This chunk should contain global configuration commands.
+## Use this to set knitr options and related things. Everything
+## in this chunk will be included in an appendix to document the
+## configuration used.
+output <- opts_knit$get("rmarkdown.pandoc.to")
+opts_knit$set(stop_on_error = 2L)
+
+## By default R code is only included in HTML versions of the report
+## (where it can be collapsed). You can generate a PDF version
+## using rmarkdown::pdf_document to get a copy for print. Extensive
+## chunks of R code may or may not be desired in /hat setting. If you
+## want them simply change the following arguments to `echo = TRUE`.
+## In either case the default can be overwritten for individual chunks.
+opts_chunk$set(echo = output == "html")
+opts_chunk$set(warning = output == "html")
+opts_chunk$set(message = output == "html")
+
+## Cache options
+opts_chunk$set(cache = FALSE)
+
+## Figure options
+## Set default figure format
+# options(reportmd.figure.format=params$format)
+
+## Set 'hide.fig.code' to FALSE to include code chunks that
+## produce Figures in the output. Note that this affects all chunks
+## that provide a figure caption.
+opts_chunk$set(hold = TRUE, hide.fig.code = FALSE)
+
+## Set up default plotting options for different formats.
+## These can be overwritten for individual chunks
+# interactiveFig()
+# screenFig()
+# printFig()
+
+## Pander options
+panderOptions("digits", 3)
+panderOptions("table.split.table", 160)
+
+## Configure Figure and Table lables
+# options(figcap.prefix = "Figure", figcap.sep = ":", figcap.prefix.highlight = "**")
+# options(tabcap.prefix = "Table", tabcap.sep = ":", tabcap.prefix.highlight = "**")
+
+## Install required knitr hooks
+# installHooks()
+```
+```{r functions, eval=TRUE, include=FALSE}
+alg <- function(data) {
+  if (dim(data)[1] <= 0) {
+    return(NULL)
+  }
+  cat.col.number <- ncol(data)
+  if (length(unique(data[, cat.col.number])) < 2 ||
+    min(table(as.numeric(data[, cat.col.number]))) < 2) {
+    return(NULL)
+  }
+
+  x <- data[, 1:(cat.col.number - 1)]
+  y <- data[, cat.col.number]
+  model_lambda <-
+    glmnet(as.matrix(x),
+      y,
+      alpha = 1,
+      family = "binomial"
+    )
+  if (is.null(model_lambda)) {
+    cat("Model_lambda is null")
+  }
+  model_lambda
+}
+
+validF <- function(model, test) {
+  cat.col.number <- ncol(test)
+  if (is.null(model)) {
+    cat("model is null\n")
+    return(
+      list(
+        acc = max(table(test[, cat.col.number]) / dim(test)[1]),
+        se = max(table(test[, cat.col.number]) / dim(test)[1]),
+        sp = max(table(test[, cat.col.number]) / dim(test)[1])
+      )
+    )
+  }
+  AIC <- deviance(model) + 2 * model$df
+  best_s <- which.min(AIC)
+  x_test <- test[, 1:(cat.col.number - 1)]
+  y_test <- test[, cat.col.number]
+  new_x <- as.matrix(x_test)
+  pred <- as.numeric(predict(
+    model,
+    newx = new_x,
+    type = "class",
+    s = model$lambda[[best_s]]
+  ))
+  conf_matrix <- table(
+    Fact = y_test,
+    Prediction = pred == levels(y_test)[[1]]
+  )
+  if (dim(conf_matrix)[[2]] == 1) {
+    dim_name <- attributes(conf_matrix)$dimnames[[2]][[1]]
+    if (dim_name == "TRUE") {
+      tp <- conf_matrix[levels(y_test)[[1]], "TRUE"]
+      tn <- 0
+      fp <- conf_matrix[levels(y_test)[[2]], "TRUE"]
+      fn <- 0
+    } else {
+      fn <- conf_matrix[levels(y_test)[[1]], "FALSE"]
+      tp <- 0
+      tn <- conf_matrix[levels(y_test)[[2]], "FALSE"]
+      fp <- 0
+    }
+  } else {
+    tp <- conf_matrix[levels(y_test)[[1]], "TRUE"]
+    tn <- conf_matrix[levels(y_test)[[2]], "FALSE"]
+    fp <- conf_matrix[levels(y_test)[[2]], "TRUE"]
+    fn <- conf_matrix[levels(y_test)[[1]], "FALSE"]
+  }
+  list(
+    acc = (tp + tn) / (tp + tn + fp + fn),
+    se = tp / (tp + tn),
+    sp = fp / (fp + tn)
+  )
+}
+
+scientific_10 <- function(x) {
+  y <- gsub("e-0", "e-", format(x, scientific = TRUE, trim = TRUE))
+  y <- gsub("e\\+0", "e", y)
+  text_labs <- gsub("e", " %*% 10^\"", paste0(y, "\""))
+  zeros <- stri_startswith_fixed(text_labs, pattern = "0 %")
+  text_labs[which(zeros)] <- "0"
+  zeros <- stri_startswith_fixed(text_labs, pattern = "0.0 %")
+  text_labs[which(zeros)] <- "0"
+  na_s <- stri_startswith_fixed(text_labs, pattern = "NA")
+
+  text_labs[which(na_s)] <- "NA"
+  str2expression(text_labs)
+}
+
+get_acquisition_params <- function(path, outfile = stderr()) {
+  ds_params <- stringi::stri_split_regex(basename(path), pattern = "\\.")[[1]]
+  if (length(ds_params) < 5) {
+    cat(
+      "Failed to obtain acquisition parameters from the path given!\n",
+      file = outfile
+    )
+    NULL
+  }
+  ds_expt <- as.numeric(stringi::stri_split_regex(
+    ds_params[[1]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  ds_res <- as.numeric(stringi::stri_split_regex(
+    ds_params[[2]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  ds_mode <- as.numeric(stringi::stri_split_regex(
+    ds_params[[3]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  ds_dev <- as.integer(stringi::stri_split_regex(
+    ds_params[[4]],
+    pattern = "[\\D]+"
+  )[[1]])
+  ds_dev <- ds_dev[which(!is.na(ds_dev))]
+  ds_range <- as.numeric(stringi::stri_split_regex(
+    ds_params[[5]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  list(
+    expt_id = ds_expt,
+    resol_id = ds_res,
+    pol_id = ds_mode,
+    dev_id = ds_dev,
+    mzrange_id = ds_range
+  )
+}
+align_spectra <- function(
+  spectra, ref_scans, hw_size, tol_align, snr, verbose = FALSE
+) {
+  if (length(spectra) == 0) {
+    return(spectra)
+  }
+  res <- tryCatch(
+    MALDIquant::alignSpectra(
+      spectra, reference = ref_scans, 
+      halfWindowSize = hw_size, tolerance = tol_align, SNR = snr
+    ),
+    error = function(e) {
+      failure_spectrum <- stringi::stri_extract_all_regex(
+        e$message, pattern = "[\\d]+"
+      )[[1]]
+      if (length(failure_spectrum) > 0) {
+        spec_num <- as.numeric(failure_spectrum[[1]])
+        spec_files <- sapply(spectra, function(s) metaData(s)$file)
+        spec_to_exclude <- which(
+          spec_files == spectra[[spec_num]]@metaData$file
+        )
+        align_spectra(
+          spectra[-spec_to_exclude], ref_scans,
+          hw_size, tol_align, snr
+        )
+      } else {
+        if (verbose) {
+          cat(
+            "Failed to align ", length(failure_spectrum),
+            " spectra due to error: ", e$message, "\n"
+          )
+        }
+        MALDIquant::createMassSpectrum(mass = c(0), intensity = c(0))
+      }
+    }
+  )
+  return(res)
+}
+```
+
+```{r queries, include=FALSE}
+## ==================== SQL queries ====================##
+
+getDeviceQ <- "SELECT * FROM device where id = "
+getModeQ <- "select * from mode where id = "
+getResolution <- "select * from resolution where id = "
+getRange <- "select * from mzrange where id = "
+getExperimetnTypeQ <- "select * from exptype where id = "
+getDiagQ <- "select * from diagnosis where id = "
+get_tissue_query <- paste(
+  "select s.id, smpl.label as \"sample\", t.label as tissue,",
+  "s.exptype from spectrum s",
+  "join smpl smpl on s.sampleid = smpl.id ",
+  "join tissue t on smpl.tumorid = t.id where s.id in ("
+)
+```
+
+# Задача
+
+Задача заключается в определении того, как изменятся элементы вектора Шепли
+сканов, если изменить для них метки классов на противоположные.
+
+Смотрим на образцы с TCP = 100% и TCP = 0%.
+
+Для каждого образца ткани создаем усредненный скан из исходных сканов и добавляем его в датасет для расчета вектора Шепли с меткой класса, противоположной метке исходных сканов.
+
+## Материалы и методы
+
+```{r oblig.par}
+if (!("params" %in% ls())) {
+  params <- list(
+    options = list(
+      overwrite = TRUE,
+      work_dir = "data/diag_6_32/expt_1.res_1.mode_1.dev_2.mz_2/",
+      run_dir = "."
+    )
+  )
+}
+
+acq_params <- get_acquisition_params(params$options$work_dir)
+
+if (is.null(acq_params)) {
+  acq_params <- list(
+    expt_id = 1,
+    resol_id = 1,
+    pol_id = 1,
+    dev_id = 2,
+    mzrange_id = 2
+  )
+}
+
+proc_params <- ScansProcessor::get_post_proc_params(
+  resolution_id = acq_params$resol_id,
+  polarity_id = acq_params$pol_id,
+  range_id = acq_params$mzrange_id
+)
+
+data_root_path <- params$options$work_dir
+options <- params$options
+options$target_diag <- 6
+options$base_diag <- 32
+options$base <- "Brain"
+
+log_file <- file.path(
+  options$work_dir,
+  "log_file_shapley.txt"
+)
+cat(
+  "====\tStarted at ",
+  format(Sys.time(), "%Y.%m.%d.%H_%M_%S"),
+  "\t====\n",
+  "R_HOME: ", Sys.getenv("R_HOME"), "\n",
+  file = log_file,
+  append = TRUE
+)
+```
+
+```{r db.connect, eval=TRUE}
+conn <- RODBC::odbcDriverConnect(
+  paste0(
+    "driver=MonetDB;server=",
+    host,
+    ";database=", dbname,
+    ";uid=", usr,
+    ";pwd=", pwd
+  )
+)
+```
+
+```{r input.params}
+diags_info <- rbind(
+  sqlQuery(conn, paste0(getDiagQ, options$target_diag)),
+  sqlQuery(conn, paste0(getDiagQ, options$base_diag))
+)
+if (options$base_diag == 32) {
+  diags_info$description[[2]] <- "Quasi-healthy brain"
+}
+```
+
+```{r loadfm}
+load(file.path(
+  options$work_dir,
+  "all_fm_data.RData"
+))
+```
+
+В работе используются масс-спектрометрические данные, полученные с образцов тканей головного мозга человека с диагнозами \textbf{`r diags_info$name[[1]]`} и патологии не-опухолевой природы. Данные были получены с помощью масс-спектрометра Thermo LTQ XL Orbitrap ETD (Thermo Fisher Scientific; США) с картриджной ионизацией [@Pekov2021a; @bormotov_incorporation_2023].
+
+Предварительная обработка масс-спектрометрических данных производилась с использованием параметров, указанных в таблице \ref{tab:paramstable}. Значения параметров взяты из результатов работы по определению оптимальных значений параметров предварительной обработки [@zavorotnyuk_determining_2024].
+
+## Acquisition parameters
+
+В таблице \ref{tab:acqparams} приведены параметры масс-спектрометрических данных.
+
+```{r acqparams}
+kable(
+  acq_params_df, format = "latex",
+  caption = "Ion acquisition parameters", row.names = FALSE, booktabs = TRUE
+) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position")) %>%
+  column_spec(4, width = "10em")
+```
+
+## Данные о доли опухолевых клеток
+
+Данные о количественном содержании опухолевых клеток находятся в \href{`r limp_bd_ggl`}{GoogleSheet файле}.
+
+```{r loadtcp}
+tcp_data_file <- file.path(
+  options$run_dir,
+  "tcp_data.rds"
+)
+tcp_data_table <- readRDS(tcp_data_file)
+tcp_summary <- cbind(
+  tcp_data_table %>% filter(tcp == 100) %>%
+    summarise(tcp100 = n()),
+  tcp_data_table %>% filter(tcp >= 50 & tcp < 100) %>%
+    summarise(tcp50 = n()),
+  tcp_data_table %>% filter(tcp < 50 & tcp > 0) %>%
+    summarise(tcp0_50 = n()),
+  tcp_data_table %>% filter(tcp == 0) %>%
+    summarise(tcp0 = n())
+)
+rownames(tcp_summary) <- linebreak(c("Количество образцов\nтканей"))
+kable(
+  tcp_summary,
+  format = "latex",
+  caption = "TCP summary",
+  booktabs = TRUE,
+  col.names = c("TCP100", "TCP50-100", "TCP0-50", "TCP0"),
+  row.names = TRUE,
+  escape = FALSE
+) %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+## MS data preprocessing parameters
+
+```{r paramstable}
+kable(
+  reshape2::melt(
+    as.data.frame(proc_params)
+  ),
+  format = "latex",
+  caption = "Preprocessing parameters",
+  booktabs = TRUE,
+  col.names = c("Parameter", "Value")
+) %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+## Feature matrix
+
+```{r avgfm}
+result_fm_df <- data.frame(
+  samples = nrow(result_fm),
+  features = ncol(result_fm)
+)
+kable(
+  result_fm_df, format = "latex",
+  caption = "Feature matrix with averaged data", longtable = TRUE,
+  booktabs = TRUE
+) %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+## Shapley calculation
+
+### Sampling
+
+Обеспечиваем выполнение условий:
+
+  * сканы одного образца ткани не должны быть одновременно и в тренировочном, и в проверочном наборах данных;
+  * в тренировочный набор данных попадают сканы всех картриджей образца "4622/19 2".
+  
+В датасет добавляем сканы по методу SMOTE [@chawlaSMOTESyntheticMinority2002]: выбираем сканы с TCP = 0% и 100%, создаем усредненные по образцам сканы и меняем таким усредненным сканам метки классов на противоположные.
+
+Замену меток классов производим у половины сканов из каждого диагноза.
+
+```{r sampling}
+result_meta_data$class <- as.factor(result_meta_data$diagnosis)
+tsamples <- result_meta_data %>%
+  select(tissue, sample, diagnosis, tsample) %>% distinct()
+probs <- rep_len(0.5, nrow(tsamples))
+special_tissues <- c("4622/19 2")
+special_idx <- which(tsamples$tissue %in% special_tissues)
+if (length(special_idx) > 0) {
+  probs[special_idx] <- 1
+}
+train_unique_samples <- sample(
+  tsamples$tsample,
+  size = 0.75 * nrow(tsamples),
+  prob = probs
+)
+train_idx <- which(result_meta_data$tsample %in% train_unique_samples)
+train_data_set <- as.data.frame(cbind(
+  result_fm[train_idx, ],
+  result_meta_data[train_idx, "class"]
+))
+train_meta_data <- result_meta_data[train_idx, ]
+test_data_set <- as.data.frame(cbind(
+  result_fm[-train_idx, ],
+  result_meta_data[-train_idx, "class"]
+))
+names(train_data_set)[[dim(train_data_set)[[2]]]] <- "class"
+train_data_set$class <- as.factor(train_data_set$class)
+levels(train_data_set$class) <- levels(result_meta_data$class)
+names(test_data_set)[[dim(test_data_set)[[2]]]] <- "class"
+test_data_set$class <- as.factor(test_data_set$class)
+levels(test_data_set$class) <- levels(result_meta_data$class)
+test_meta_data <- result_meta_data[-train_idx, ]
+df <- rbind(
+  table(train_data_set[, dim(train_data_set)[[2]]]),
+  table(test_data_set[, dim(test_data_set)[[2]]])
+)
+row.names(df) <- c("Train data set", "Test data set")
+kable(
+  df,
+  format = "latex",
+  row.names = TRUE,
+  caption = "Train/Test data set scans count",
+) %>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+```{r smote}
+colMedian <- function(peaks) {
+  apply(peaks, MARGIN = 2, FUN = median)
+}
+averaged_data_rds_file <- file.path(
+  options$work_dir,
+  "averaged_features.RData"
+)
+if (file.exists(averaged_data_rds_file)) {
+  load(averaged_data_rds_file)
+} else {
+  smote_peaks_df <- as.data.frame(cbind(
+    avg_fm,
+    avg_meta_data$diagnosis
+  ))
+  names(smote_peaks_df) <- c(
+    attr(result_fm, "mass"),
+    "class"
+  )
+  avg_meta_data$class <- avg_meta_data$diagnosis
+  sampled_smote_peaks <- avg_meta_data %>%
+    slice_sample(prop = 1 / 2, by = class)
+  sampled_smote_peaks$class <- ifelse(sampled_smote_peaks$class == 6, 32, 6)
+  true_smote_peaks <- setdiff(avg_meta_data$idx, sampled_smote_peaks$idx)
+  true_smote_peaks_idx <- which(avg_meta_data$idx %in% true_smote_peaks)
+  fake_smote_peaks_idx <- which(!(avg_meta_data$idx %in% true_smote_peaks))
+  smote_peaks_df$class[-true_smote_peaks_idx] <- sampled_smote_peaks$class
+
+  df_info <- data.frame(
+    scans_file = sub(
+      "Neurosurgery/",
+      "", avg_meta_data$file
+    ),
+    orig_class = avg_meta_data$diagnosis,
+    mod_class = smote_peaks_df$class
+  )
+  kable(
+    df_info, format = "latex",
+    row.names = FALSE,
+    col.names = c("Scans file", "Original label", "Modified label"),
+    caption = "Averaged features labels distribution"
+  ) %>%
+    kable_styling(latex_options = "HOLD_position")
+  save(
+    true_smote_peaks_idx,
+    fake_smote_peaks_idx,
+    sampled_smote_peaks,
+    smote_peaks_df,
+    file = averaged_data_rds_file
+  )
+}
+```
+
+### Calculate ShapleyValue
+```{r shapcalc}
+train_test_rds_file <- file.path(
+  options$work_dir,
+  "train_test_set.Rdata"
+)
+if (file.exists(train_test_rds_file)) {
+  load(train_test_rds_file)
+} else {
+  probs <- rep_len(0.5, length(train_idx))
+  special_idx <- which(result_meta_data$tissue[train_idx] %in% special_tissues)
+  if (length(special_idx) > 0) {
+    probs[special_idx] <- 1
+  }
+  shap_train_idx <- sample(train_idx, size = 1500, prob = probs)
+  shap_train_set <- as.data.frame(cbind(
+    result_fm[shap_train_idx, ],
+    result_meta_data[shap_train_idx, "class"]
+  ))
+  names(shap_train_set) <- c(
+    attr(result_fm, "mass"),
+    "class"
+  )
+  shap_train_set$class <- as.factor(shap_train_set$class)
+  levels(shap_train_set$class) <- levels(result_meta_data$class)
+
+  shap_test_set <- test_data_set %>% slice_sample(
+    n = 255, by = class
+  )
+
+  shap_train_set <- rbind(
+    shap_train_set,
+    smote_peaks_df
+  )
+  kable(
+    table(shap_train_set$class),
+    format = "latex",
+    caption = "Train set class distribution"
+  ) %>%
+    kable_styling(latex_options = "HOLD_position")
+  kable(
+    table(shap_test_set$class),
+    format = "latex",
+    caption = "Test set class distribution"
+  ) %>%
+    kable_styling(latex_options = "HOLD_position")
+  save(
+    train_idx,
+    train_data_set,
+    test_data_set,
+    shap_train_idx,
+    shap_train_set,
+    shap_test_set,
+    file = train_test_rds_file
+  )
+}
+rdata_name <- file.path(
+  options$work_dir,
+  paste0(diags_info$id[[1]], "_", diags_info$id[[2]], "_tmp")
+)
+res <- dataShapleyI5_ext(
+  shap_train_set, alg, validF, shap_test_set, .continue = TRUE,
+  tol = 0.1, log.file = log_file, log.append = TRUE,
+  rdata.name = rdata_name
+)
+saveRDS(
+  res,
+  file = file.path(
+    options$work_dir,
+    "shapley_results.rds"
+  )
+)
+```
+
+# Литература
+
+::: {#refs}
+:::
+
+# Appendix {.tabset}
+
+## R-code
+
+```{r get-labels, echo = FALSE}
+labs = knitr::all_labels()
+labs = setdiff(labs, c("functions", "setup", "queries"))
+```
+
+```{r all-code, ref.label=labs, eval=FALSE, echo=TRUE}
+```
+
+## Functions
+```{r functions, eval=FALSE, include=TRUE, echo=TRUE}
+```
+
+## SQL queries
+
+```{r queries, eval=FALSE, include=TRUE, echo=TRUE}
+```
+
+## Setup R
+```{r setup, eval=FALSE, echo=TRUE}
+```
+
+## Versions
+
+### Document version
+
+```{r docVersion, echo=FALSE, results='asis', cache=FALSE}
+cat(params$version)
+```
+
+### Session Info
+
+```{r sessionInfo, echo=FALSE, results='asis', class='text', warning=FALSE}
+pander(devtools::session_info()[[1]])
+cat("\n")
+pander(
+  as.data.frame(
+    devtools::session_info()[[2]][, c("loadedversion", "source", "date")]
+  )
+)
+```

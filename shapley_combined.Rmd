@@ -1,0 +1,3020 @@
+---
+title: "Combined results"
+subtitle: "Shapley-TCP missannotation"
+author: Denis Zavorotnyuk
+date: '`r format(Sys.time(), "%d-%m-%Y")`'
+output:
+  pdf_document:
+    keep_tex: yes
+    number_sections: yes
+  html_document: default
+params:
+  format: !r if(opts_knit$get("rmarkdown.pandoc.to") == 'html') c('screen', 'print')
+    else 'print'
+  version: !r if(nchar(Sys.which("git"))) system("git describe --long --dirty --abbrev=10  --tags  --always",
+    intern=TRUE) else date()
+  options: !r list(
+                overwrite = TRUE,
+                work_dir = getwd()
+                )
+bibliography: '`r file.path(params$options$run_dir, "Shapley value for mislabling.bib")`'
+csl: '`r file.path(params$options$run_dir, "elseiver_vancouver.csl")`'
+header-includes:
+- \usepackage[T2A]{fontenc}
+- \usepackage[utf8]{inputenc}
+- \usepackage[english,russian]{babel}
+- \usepackage{grffile}
+- \usepackage{rotating}
+- \usepackage{caption}
+- \usepackage{longtable}
+- \usepackage{lscape}
+- \usepackage{float}
+- \usepackage{hyperref}
+- \usepackage{breakurl}
+- \usepackage{makecell}
+- \hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    }
+---
+
+```{r loadPackages, include=FALSE, cache=FALSE}
+## load additional packages in this chunk
+library(pander)
+library(stringi)
+library(knitr)
+library(caret)
+library(ggplot2)
+library(ggrepel)
+library(ggsci)
+library(ggpmisc)
+library(data.table)
+library(plyr)
+library(dplyr)
+library(xtable)
+library(RODBC)
+library(glmnet)
+library(kableExtra)
+library(latex2exp)
+library(patchwork)
+library(VennDiagram)
+library(viridisLite)
+library(ggtext)
+library(randomForest)
+library(pROC)
+library(tidyr)
+
+opts_chunk$set(echo = FALSE)
+opts_chunk$set(warning = FALSE)
+opts_chunk$set(cache = FALSE)
+```
+
+```{r queries, include=FALSE}
+## ==================== SQL queries ====================##
+get_patient_info_query <- paste(
+  "select p.* from patient p inner join",
+  "tissue t on p.id = t.patientid",
+  "where t.label = '"
+)
+getDiagQ <- "select * from diagnosis where id = "
+```
+
+```{r functions, include=FALSE, cache=FALSE}
+get_acquisition_params <- function(path, outfile = stderr()) {
+  ds_params <- stringi::stri_split_regex(basename(path), pattern = "\\.")[[1]]
+  if (length(ds_params) < 5) {
+    cat(
+      "Failed to obtain acquisition parameters from the path given!\n",
+      file = outfile
+    )
+    NULL
+  }
+  ds_expt <- as.numeric(stringi::stri_split_regex(
+    ds_params[[1]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  ds_res <- as.numeric(stringi::stri_split_regex(
+    ds_params[[2]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  ds_mode <- as.numeric(stringi::stri_split_regex(
+    ds_params[[3]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  ds_dev <- as.integer(stringi::stri_split_regex(
+    ds_params[[4]],
+    pattern = "[\\D]+"
+  )[[1]])
+  ds_dev <- ds_dev[which(!is.na(ds_dev))]
+  ds_range <- as.numeric(stringi::stri_split_regex(
+    ds_params[[5]],
+    pattern = "[\\D]+"
+  )[[1]][[2]])
+  list(
+    expt_id = ds_expt,
+    resol_id = ds_res,
+    pol_id = ds_mode,
+    dev_id = ds_dev,
+    mzrange_id = ds_range
+  )
+}
+get_cv_model_summary <- function(model, x_data, y_data) {
+  tumor_idx <- which(
+    stri_count_fixed(levels(y_data), "6") > 0
+  )
+  data_predicted <- predict(
+    model$bestModel,
+    newdata = x_data,
+    type = "prob"
+  )
+  roc_data <- pROC::roc(
+    y_data,
+    data_predicted[, levels(y_data)[tumor_idx]]
+  )
+  best_tune_idx <- which(model$results$lambda == model$bestTune$lambda)
+  list(
+    # Гиперпараметры
+    best_tune = model$bestTune,
+
+    # CV метрики
+    cv_metrics = model$results[
+      best_tune_idx,
+      c("lambda", "ROC", "Acc", "Sens", "Spec")
+    ],
+
+    # Коэффициенты (ненулевые)
+    coefficients = as.matrix(model$coeffs),
+
+    # Количество отобранных признаков
+    n_selected = sum(
+      model$coeffs != 0
+    ),
+
+    # Метрики на данных
+    performance = confusionMatrix(
+      as.factor(data_predicted[, levels(y_data)[tumor_idx]] > 0.5),
+      as.factor(y_data == levels(y_data)[tumor_idx]),
+      positive = "TRUE"
+    ),
+    roc = roc_data,
+    # AUC
+    auc = pROC::auc(
+      roc_data
+    ),
+    neg_shap_ratio = model$neg_shap_ratio
+  )
+}
+get_fold_model_summary <- function(model, x_data, y_data, indices, fid) {
+  if (any(table(y_data) == 0) || is.null(model)) {
+    return(
+      list(
+        cv_metrics = data.frame(
+        ROC = 0,
+        Sens = 0,
+        Spec = 0,
+        Acc = 0
+      )
+      )
+    )
+  }
+  tumor_idx <- which(
+    stri_count_fixed(levels(y_data), "6") > 0
+  )
+  data_predicted <- predict(
+    model,
+    newdata = x_data,
+    type = "prob"
+  )
+  pred_class <- predict(
+    model,
+    newdata = x_data,
+    type = "raw"
+  )
+  roc_data <- pROC::roc(
+    y_data,
+    data_predicted[, levels(y_data)[tumor_idx]],
+    levels = c("class32", "class6"),
+    direction = "<"
+  )
+  metrics_at_0.5 <- pROC::coords(
+    roc_data,
+    x = 0.5,  # порог
+    input = "threshold",
+    ret = c("threshold", "sensitivity", "specificity", "accuracy", "precision")
+  )
+  pos_class_cnt <- table(
+    model$trainingData$.outcome
+  )["class6"]
+  best_lambda <- model$bestTune$lambda
+  coefs <- coef(model$finalModel, s = best_lambda)[-1, 1]
+  n_preds <- length(which(coefs != 0))
+  list(
+    # Гиперпараметры
+    cv_metrics = data.frame(
+      ROC = as.numeric(roc_data$auc),
+      Sens = metrics_at_0.5$sensitivity,
+      Spec = metrics_at_0.5$specificity,
+      Acc = metrics_at_0.5$accuracy,
+      Samples = nrow(model$trainingData),
+      TestSize = nrow(x_data),
+      PosClassRatio = pos_class_cnt / nrow(model$trainingData),
+      n_preds = n_preds
+    ),
+    pred = data.frame(
+      rowIndex = indices,       # индексы строк
+      obs = y_data,                   # реальные классы
+      pred = pred_class,              # предсказанные классы
+      class6 = data_predicted$class6,      # вероятность class6
+      class32 = data_predicted$class32,    # вероятность class32
+      Resample = paste0("Fold", fid)    # имя фолда
+    ),
+    coefs = coefs
+  )
+}
+create_group_folds <- function(data, k = 5) {
+  # ============================================
+  # Группированная стратифицированная CV
+  # ============================================
+  n_cols <- ncol(data)
+  groups <- data[, n_cols]  # например, ID клиентов
+
+  # Получаем уникальные группы для каждого класса
+  groups_class6 <- unique(groups[data$class == "6"])
+  groups_class32 <- unique(groups[data$class == "32"])
+  # Перемешиваем группы
+  groups_class6_shuffled <- sample(groups_class6)
+  groups_class32_shuffled <- sample(groups_class32)
+
+  # Размер фолда для групп
+  fold_size_groups6 <- floor(length(groups_class6_shuffled) / k)
+  fold_size_groups32 <- floor(length(groups_class32_shuffled) / k)
+
+  # Создаем фолды
+  folds <- list()
+  for (i in 1:k) {
+    # Группы class6 для валидации
+    start6 <- (i - 1) * fold_size_groups6 + 1
+    end6 <- ifelse(
+      i == k, length(groups_class6_shuffled), i * fold_size_groups6
+    )
+    test_groups6 <- groups_class6_shuffled[start6:end6]
+
+    # Группы class32 для валидации
+    start32 <- (i - 1) * fold_size_groups32 + 1
+    end32 <- ifelse(
+      i == k, length(groups_class32_shuffled), i * fold_size_groups32
+    )
+    test_groups32 <- groups_class32_shuffled[start32:end32]
+
+    # Индексы для валидации (все строки с этими группами)
+    test_idx <- which(groups %in% c(test_groups6, test_groups32))
+    folds[[i]] <- test_idx
+  }
+  folds
+}
+alg_cv <- function(data, repeats = 10, k = 3) {
+  if (dim(data)[1] <= 0) {
+    return(NULL)
+  }
+  # n_cols <- ncol(data)
+  category_column_idx <- which(names(data) == "class")
+  if (length(unique(data[, category_column_idx])) < 2 ||
+    min(table(as.numeric(data[, category_column_idx]))) < 2) {
+    return(NULL)
+  }
+  set.seed(202022026)
+  # посмотреть коэффициенты моделей, сколько там ненулевых.
+  # низкая специфичность - это плохо.
+  # нужно сделать CV, проверять на проверочном наборе.
+  # проверить, что специфичность считается правильно
+  # посмотреть в caret one-class-classifier
+  train_control <- trainControl(
+    method = "none",
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary,
+    savePredictions = TRUE
+  )
+  lambda_grids <- expand.grid(
+    alpha = 1,
+    lambda = 10^(seq(-4, 0, length = 20))
+  )
+  cv_data <- lapply(seq_len(nrow(lambda_grids)), function(al) {
+    tune_grid <- lambda_grids[al, ]
+    repeats_data <- lapply(seq_len(repeats), function(rep) {
+      groups_kfolds <- create_group_folds(data, k = k)
+      folds_data <- lapply(seq_along(groups_kfolds), function(fid) {
+        validating_index <- groups_kfolds[[fid]]
+        x <- data[-validating_index, 1:(category_column_idx - 1)]
+        y <- as.factor(
+          paste0("class", data[-validating_index, category_column_idx])
+        )
+        y <- factor(y, levels = c("class6", "class32"))
+        x_test <- data[validating_index, 1:(category_column_idx - 1)]
+        y_test <- as.factor(
+          paste0("class", data[validating_index, category_column_idx])
+        )
+        y_test <- factor(y_test, levels = c("class6", "class32"))
+        if (min(table(y)) < 2) {
+          fold_model <- NULL
+        } else {
+          fold_model <- caret::train(
+            x = x, y = y,
+            method = "glmnet",
+            family = "binomial",
+            trControl = train_control,
+            tuneGrid = tune_grid,
+            preProcess = "scale"
+          )
+        }
+        fold_metrics <- get_fold_model_summary(
+          fold_model, x_test, y_test, validating_index, fid
+        )
+        fold_metrics$cv_metrics$neg_shap_ratio <- length(
+          which(data[-validating_index, "shapley"] < 0)
+        ) / nrow(x)
+        predictor_intensities <- x |>
+          select(names(x)[which(fold_metrics$coefs != 0)]) |>
+          mutate(
+            class = y,
+            fid = fid,
+            rep = rep
+          )
+        list(
+          model = fold_model,
+          metrics = fold_metrics,
+          coefficients = fold_metrics$coefs,
+          fold_shapley = data.frame(
+            shapley = data[-validating_index, "shapley"],
+            fid = fid
+          ),
+          predintens = predictor_intensities
+        )
+      })
+      fd_metrics <- ldply(folds_data, function(fd) fd$metrics$cv_metrics)
+      fd_preds <- ldply(
+        folds_data, function(fd) fd$metrics$pred
+      )
+      fd_preds$lambda <- tune_grid$lambda
+      fd_preds$Resample <- paste0(
+        "Rep", rep, fd_preds$Resample
+      )
+      fd_metrics$resample <- paste0(
+        "Rep", rep, "Fold", seq_along(groups_kfolds)
+      )
+      fd_coefs <- ldply(folds_data, function(fd) {
+        reshape2::melt(
+          fd$predintens,
+          id.vars = c("class", "fid", "rep"),
+          variable.name = "MZ",
+          value.name = "intensity"
+        )
+      })
+      list(
+        lambda = tune_grid$lambda[[1]],
+        resample = fd_metrics,
+        pred = fd_preds,
+        coefs = fd_coefs
+      )
+    })
+    rd_preds <- ldply(
+      repeats_data, function(rd) rd$pred
+    )
+    predictors <- ldply(repeats_data, function(rd) rd$coefs)
+    predictors$class <- as.factor(predictors$class)
+    rep_resamples <- ldply(repeats_data, function(rd) rd$resample)
+    rd_preds$lambda <- tune_grid$lambda
+    mean_metrics <- colMeans(rep_resamples[, 1:4])
+    list(
+      metrics = mean_metrics,
+      lambda = tune_grid$lambda[[1]],
+      resample = rep_resamples,
+      pred = rd_preds,
+      predictors_df = predictors
+    )
+  })
+  all_metrics <- ldply(cv_data, function(cvd) cvd$metrics)
+  all_metrics$alpha <- 1
+  all_metrics$lambda <- sapply(cv_data, function(cvd) cvd$lambda)
+  idx <- which.max(all_metrics$ROC)
+  best_tune <- all_metrics[idx, ]
+  x <- data[, 1:(category_column_idx - 1)]
+  y <- as.factor(paste0("class", data[, category_column_idx]))
+  y <- factor(y, levels = c("class6", "class32"))
+  best_model <- caret::train(
+    x = x, y = y,
+    method = "glmnet",
+    family = "binomial",
+    trControl = train_control,
+    tuneGrid = best_tune[, c("alpha", "lambda")],
+    preProcess = "scale"
+  )
+  bestModel_coefs <- coef(best_model$finalModel, s = best_tune$lambda)[-1, 1]
+  predictor_intensities <- x |>
+    select(names(x)[which(bestModel_coefs != 0)]) |>
+    mutate(
+      class = y
+    )
+  list(
+    bestModel = best_model,
+    bestTune = best_tune,
+    results = all_metrics,
+    coeffs = bestModel_coefs,
+    resample = cv_data[[idx]]$resample,
+    pred = cv_data[[idx]]$pred,
+    predictors_df = cv_data[[idx]]$predictors_df,
+    neg_shap_ratio = length(
+      which(data[, "shapley"] < 0)
+    ) / nrow(data),
+    bestModel_predictors = predictor_intensities
+  )
+}
+
+valid_cv <- function(model, test_data) {
+  category_column_idx <- which(names(test_data) == "class")
+  if (is.null(model)) {
+    cat("model is null\n")
+    return(
+      list(
+        acc = 0,
+        se = 0,
+        sp = 0
+      )
+    )
+  }
+  x_test <- test_data[, 1:(category_column_idx - 1)]
+  y_test <- as.factor(
+    paste0("class", test_data[, category_column_idx])
+  )
+  ext_info <- get_cv_model_summary(
+    model, x_test, y_test
+  )
+  list(
+    acc = ext_info$performance$overall[["Accuracy"]],
+    se = ext_info$performance$byClass[["Sensitivity"]],
+    sp = ext_info$performance$byClass[["Specificity"]],
+    n_selected = ext_info$n_selected,
+    ROC = ext_info$auc,
+    ROC_resampling = ext_info$cv_metrics$ROC,
+    p_value = ext_info$performance$overall[[6]],
+    ext_info = ext_info
+  )
+}
+extract_cv_metrics <- function(model, dataset_name, pred = NULL) {
+  # Извлекаем результаты по каждому фолду
+  cv_results <- model$resample
+  pred_data <- model$pred
+  if (is.null(pred_data)) {
+    pred_data <- pred
+  }
+
+  accuracy_by_fold <- pred_data %>%
+    group_by(Resample) %>%
+    summarise(
+      Acc_0.5 = mean((class6 >= 0.5) == (obs == "class6"), na.rm = TRUE)
+    )
+
+  acc_summary <- accuracy_by_fold %>%
+    summarise(
+      Acc_mean = mean(Acc_0.5, na.rm = TRUE),
+      Acc_sd = sd(Acc_0.5, na.rm = TRUE),
+      n_folds = n()
+    )
+  metrics_summary <- cv_results %>%
+    summarise(
+      ROC_mean = mean(ROC, na.rm = TRUE),
+      ROC_sd = sd(ROC, na.rm = TRUE),
+      Sens_mean = mean(Sens, na.rm = TRUE),
+      Sens_sd = sd(Sens, na.rm = TRUE),
+      Spec_mean = mean(Spec, na.rm = TRUE),
+      Spec_sd = sd(Spec, na.rm = TRUE),
+      n_folds = n()
+    )
+    
+  result <- metrics_summary %>%
+    mutate(
+      Acc_mean = acc_summary$Acc_mean,
+      Acc_sd = acc_summary$Acc_sd
+    ) %>%
+    mutate(
+      Dataset = dataset_name,
+      ROC_lower = ROC_mean - 1.96 * ROC_sd / sqrt(n_folds),
+      ROC_upper = ROC_mean + 1.96 * ROC_sd / sqrt(n_folds),
+      Sens_lower = Sens_mean - 1.96 * Sens_sd / sqrt(n_folds),
+      Sens_upper = Sens_mean + 1.96 * Sens_sd / sqrt(n_folds),
+      Spec_lower = Spec_mean - 1.96 * Spec_sd / sqrt(n_folds),
+      Spec_upper = Spec_mean + 1.96 * Spec_sd / sqrt(n_folds),
+      Acc_lower = Acc_mean - 1.96 * Acc_sd / sqrt(n_folds),
+      Acc_upper = Acc_mean + 1.96 * Acc_sd / sqrt(n_folds)
+    )
+  result
+}
+my_dotplot <- function(plot_data, caption_str, scales = "fixed") {
+  ggplot(
+    plot_data,
+    aes(value, name)
+  ) +
+    facet_grid(. ~ Metric, scales = scales) +
+    geom_boxplot(aes(color = ds), width = 0.4) +
+    scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 15)) +
+    # Подписи
+    labs(
+      caption = caption_str,
+      x = "Metric value",
+      y = NULL,
+      color = "Ions"
+    ) +
+    # Тема
+    theme_bw() +
+    theme(
+      legend.position = "right",
+      legend.title = element_text(size = 11, face = "bold"),
+      legend.text = element_text(size = 10),
+      # strip.text = element_text(size = 12, face = "bold", color = "white"),
+      # strip.background = element_rect(fill = "#2c3e50", color = NA),
+      axis.text.y = element_text(size = 8),
+      axis.text.x = element_text(size = 8),
+      axis.title.x = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      panel.spacing = unit(1, "lines")
+    )
+}
+plot_roc <- function(validated_models, ds_names, mode_name) {
+  ldply(
+    seq_along(validated_models), function(vm_idx) {
+      vm <- validated_models[[vm_idx]]
+      data.frame(
+        fpr = 1 - vm$ext_info$roc$specificities,
+        tpr = vm$ext_info$roc$sensitivities,
+        data_set = ds_names[[vm_idx]],
+        exp_mode = mode_name
+      )
+    }
+  )
+}
+get_patient_info <- function(tissue, conn) {
+  ldply(tissue, function(t) {
+    sqlQuery(
+      conn,
+      paste0(get_patient_info_query, t, "';"),
+      stringsAsFactors = TRUE, as.is = TRUE
+    )
+  })
+}
+```
+
+
+## Материалы и методы
+
+```{r oblig.par}
+if (!("params" %in% ls())) {
+  params <- list(
+    options = list(
+      overwrite = TRUE,
+      work_dir = "data/diag_6_32"
+    )
+  )
+}
+
+data_root_path <- params$options$work_dir
+options <- params$options
+log_file <- file.path(
+  options$work_dir,
+  "log_file.txt"
+)
+cat(
+  "====\tStarted at ",
+  format(Sys.time(), "%Y.%m.%d.%H_%M_%S"),
+  "\t====\n",
+  "R_HOME: ", Sys.getenv("R_HOME"), "\n",
+  file = log_file,
+  append = TRUE
+)
+```
+
+```{r db.connect, eval=TRUE}
+conn <- RODBC::odbcDriverConnect(
+  paste0(
+    "driver=MonetDB;server=",
+    host,
+    ";database=", dbname,
+    ";uid=", usr,
+    ";pwd=", pwd
+  )
+)
+```
+
+```{r input.params}
+diags_info <- ldply(
+  params$options$diags_data[1, ],
+  function(d) {
+    sqlQuery(conn, paste0(getDiagQ, d))
+  }
+)
+hlt_idx <- which(diags_info$id == 32)
+if (length(hlt_idx) > 0) {
+  diags_info[hlt_idx, c("name", "description", "ref")] <- c(
+    "Unmodified", "Quasi-healthy brain", NA
+  )
+}
+```
+
+В работе используются масс-спектрометрические данные, полученные с образцов тканей головного мозга человека с диагнозами \textbf{`r diags_info$name[[1]]`} и патологии не-опухолевой природы. Данные были получены с помощью масс-спектрометра Thermo LTQ XL Orbitrap ETD (Thermo Fisher Scientific; США) с картриджной ионизацией [@Pekov2021a; @bormotov_incorporation_2023].
+
+Предварительная обработка масс-спектрометрических данных производилась с использованием параметров, указанных в таблице \ref{tab:paramstable}. Значения параметров взяты из результатов работы по определению оптимальных значений параметров предварительной обработки [@zavorotnyuk_determining_2024].
+
+
+## Acquisition parameters
+
+```{r loadata}
+dataset_dirs <- list.dirs(options$work_dir, recursive = FALSE)
+dataset_dirs <- dataset_dirs[
+  stri_count_regex(
+    dataset_dirs,
+    "expt_\\d\\.res_\\d"
+  ) == 1
+]
+data_envs <- lapply(
+  dataset_dirs,
+  function(d) {
+    cat(
+      "Processing data from ",
+      d, "\n",
+      file = log_file,
+      append = TRUE
+    )
+    shap_env <- new.env()
+    shap_env$acq_params <- get_acquisition_params(d)
+    if (shap_env$acq_params$pol_id == 1) {
+      shap_env$data_set_name <- "Negative"
+    }
+    if (shap_env$acq_params$pol_id == 2) {
+      shap_env$data_set_name <- "Positive"
+    }
+    shap_path <- d
+    tmp_files <- list.files(
+      file.path(shap_path, "temp_data"),
+      pattern = paste0(
+        diags_info$id[[1]], "_", diags_info$id[[2]], "_tmp.RData"
+      )
+    )
+    tmp_files_info <- cbind(
+      tmp_files,
+      file.info(
+        file.path(shap_path, "temp_data", tmp_files)
+      )
+    )
+    fresh_file <- tmp_files_info[
+      order(tmp_files_info$mtime, decreasing = TRUE),
+    ][1,]
+    cat(
+      "Read data from ",
+      file.path(
+        shap_path,
+        "temp_data",
+        fresh_file$tmp_files[[1]]
+      ), "\n",
+      file = log_file,
+      append = TRUE
+    )
+    load(
+      file.path(
+        shap_path,
+        "temp_data",
+        fresh_file$tmp_files[[1]]
+      ),
+      envir = shap_env
+    )
+    shap_env$all_fm_data <- new.env()
+    load(
+      file.path(
+        shap_path, "all_fm_data.RData"
+      ),
+      envir = shap_env$all_fm_data
+    )
+    shap_env$train_test_data <- new.env()
+    load(
+      file.path(shap_path, "train_test_set.Rdata"),
+      envir = shap_env$train_test_data
+    )
+    shap_env$smote_data <- new.env()
+    load(
+      file.path(shap_path, "averaged_features.RData"),
+      envir = shap_env$smote_data
+    )
+    shap_env$cat.col.number <- ncol(shap_env$train_test_data$shap_train_set)
+    shap_env$shap_calculated <- shap_env$phiLast
+
+    shap_env$diags.info <- diags_info
+    shap_env$feature_matrix <- shap_env$all_fm_data$full_fm
+    tcp_data_file <- file.path(
+      d,
+      "..","..","..",
+      "tcp_data.rds"
+    )
+    shap_env$tcp_data_table <- readRDS(tcp_data_file)
+
+    shap_env$shap_trained_mdT <- rbind(
+      shap_env$all_fm_data$full_meta_data[
+        shap_env$train_test_data$shap_train_idx,
+      ],
+      shap_env$all_fm_data$avg_meta_data
+    )
+    shap_env$shap_trained_mdT <- cbind(
+      shap_env$shap_trained_mdT,
+      shap_env$train_test_data$shap_train_set[, "class"]
+    )
+    shap_env$ms_spectra <- readRDS(
+      file.path(
+        d,
+        "ms_spectra.rds"
+      )
+    )
+    shap_env$rf_model <- readRDS(
+      file.path(
+        d,
+        "rf_model_avg.rds"
+      )
+    )
+    shap_env
+  }
+)
+
+```
+
+## Demography data
+
+```{r demograph}
+demogr_data <- ldply(
+  data_envs,
+  function(de) {
+    demogr_data <- de$all_fm_data$full_meta_data |>
+      select(tissue, diagnosis) |>
+      distinct() |>
+      mutate(
+        tissue = stri_replace_all_regex(tissue, "(\\s\\d)", "")
+      ) |>
+      summarise(number = n(), .by = diagnosis)
+    demogr_data$Data <- de$data_set_name
+    demogr_data
+  }
+)
+
+kable(
+  demogr_data[, c("diagnosis", "number")],
+  format = "latex", caption = "Patients data",
+  row.names = FALSE, booktabs = TRUE
+) %>%
+  group_rows(index = table(demogr_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+```{r tissuesstats}
+tissue_stat_data <- ldply(
+  data_envs,
+  function(de) {
+    demogr_data <- de$all_fm_data$result_meta_data |>
+      select(tsample, diagnosis) |>
+      filter(stri_count_fixed(tsample, "AVG") == 0) |>
+      distinct() |>
+      summarise(number = n(), .by = diagnosis)
+    demogr_data$Data <- de$data_set_name
+    demogr_data
+  }
+)
+
+
+kable(
+  tissue_stat_data[, c("diagnosis", "number")],
+  format = "latex", caption = "Tissues data",
+  row.names = FALSE, booktabs = TRUE
+) %>%
+  group_rows(index = table(tissue_stat_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+## Feature matrix stats
+
+```{r fmstats}
+fm_stats <- ldply(
+  data_envs,
+  function(de) {
+    ds <- de$shap_trained_mdT |>
+      filter(stri_count_fixed(tsample, "AVG-") == 0)
+    fm_data <- data.frame(
+      tsamples = length(unique(ds$tsample)),
+      predictors = ncol(de$train_test_data$shap_train_set) - 1,
+      iterations = de$t,
+      neg_shap_prec = paste(
+        format(
+          100 * length(
+            which(
+              de$shap_calculated < 0
+            )
+          ) / length(de$shap_calculated),
+          scientific = FALSE,
+          digits = 4
+        ),
+        "%"
+      ),
+      max_shap = format(max(de$shap_calculated),
+        scientific = TRUE,
+        digits = 4
+      ),
+      min_shap = format(min(de$shap_calculated),
+        scientific = TRUE,
+        digits = 4
+      ),
+      train_samples_cnt = nrow(de$train_test_data$shap_train_set),
+      test_samples_cnt = nrow(de$train_test_data$shap_test_set),
+      Data = de$data_set_name
+    )
+  }
+)
+kable(
+  fm_stats[, seq_len(ncol(fm_stats) - 1)],
+  format = "latex", caption = "Shapley algorythm data set information",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Tissue samples number", "Features number", "Iterations number",
+    "Negative Shapley-values part", "Shapley maximum value",
+    "Shapley minimum value", "Train set size", "Validating set size"
+  )
+) %>%
+  group_rows(index = table(fm_stats$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+## Missannotation data
+
+```{r missanndat}
+md_stats <- ldply(
+  data_envs,
+  function(de) {
+    ds <- de$shap_trained_mdT |>
+      filter(stri_count_fixed(tsample, "AVG-") == 1) |>
+      select(10, 5, 12)
+    names(ds) <- c("tsample", "diagnosis", "class")
+    shap_samples_distr <- ds |>
+      mutate(
+        Annotation = ifelse(
+          as.character(diagnosis) == as.character(class), TRUE, FALSE
+        )
+      ) |>
+      distinct() |>
+      summarise(number = n(), .by = Annotation)
+    shap_samples_distr$Data <- de$data_set_name
+    shap_samples_distr
+  }
+)
+kable(
+  md_stats[, c("Annotation", "number")],
+  format = "latex", caption = "Missannotation data",
+  row.names = FALSE, booktabs = TRUE
+) %>%
+  group_rows(index = table(md_stats$Data)) %>%
+  kable_styling(latex_options = c("scale_down"), font_size = 10)
+
+md_stats <- ldply(
+  data_envs,
+  function(de) {
+    ds <- de$shap_trained_mdT |>
+      filter(stri_count_fixed(tsample, "AVG-") == 1) |>
+      select(5, 12)
+    names(ds) <- c("diagnosis", "class")
+    shap_samples_distr <- ds |>
+      mutate(
+        Annotation = ifelse(
+          as.character(diagnosis) == as.character(class), TRUE, FALSE
+        ),
+        DiagLabel = ifelse(
+          diagnosis == diags_info$id[[1]],
+          diags_info$name[[1]],
+          diags_info$name[[2]]
+        )
+      ) |> select(DiagLabel, Annotation) |>
+      count(DiagLabel, Annotation) |>
+      tidyr::pivot_wider(
+        names_from = Annotation, values_from = n, values_fill = 0
+      ) |>
+      mutate(Total = rowSums(across(where(is.numeric)))) |>
+      mutate(DiagLabel = as.character(DiagLabel)) %>%
+      bind_rows(
+        summarise(., DiagLabel = "Total", across(where(is.numeric), sum))
+      )
+    shap_samples_distr$Data <- de$data_set_name
+    shap_samples_distr
+  }
+)
+kable(
+  md_stats[, seq_len(ncol(md_stats) - 1)],
+  format = "latex", caption = "Missannotation data details",
+  row.names = FALSE, booktabs = TRUE, label = "misanndat2"
+) %>%
+  add_header_above(c(" ", " ", "Annotation" = 2)) %>%
+  group_rows(index = table(md_stats$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+## Estimated density
+
+```{r estdens, dev=c('cairo_pdf', 'png'), out.height="85%", out.width="100%"}
+est_dens_data  <- ldply(
+  data_envs,
+  function(de) {
+    shap_diag_labels <- as.factor(de$shap_trained_mdT$diagnosis)
+
+    shap_samples_distr <- data.frame(
+      shap_value = de$shap_calculated,
+      sample_labels = de$shap_trained_mdT$tsample,
+      diag_label = shap_diag_labels,
+      class_label = de$train_test_data$shap_train_set$class
+    )
+    shap_samples_distr <- shap_samples_distr |>
+      mutate(
+        Annotation = ifelse(diag_label == class_label, TRUE, FALSE),
+        ClassLabel = ifelse(
+          class_label == diags_info$id[[1]],
+          diags_info$name[[1]],
+          diags_info$name[[2]]
+        )
+      )
+    shap_samples_distr$Scan <- "RAW"
+    shap_samples_distr$Scan[seq_len(
+      nrow(de$all_fm_data$avg_meta_data)
+    ) + length(
+      de$train_test_data$shap_train_idx
+    )] <- "AVG"
+    tcp_values <- de$shap_trained_mdT$tcp
+    shap_scans_df <- cbind(
+      shap_samples_distr,
+      tcp_values
+    )
+    ordered_calc_shap_tcp <- shap_scans_df[
+      with(shap_scans_df, order(tcp_values, sample_labels)),
+    ]
+    ordered_calc_shap_tcp$sample_labels <- factor(
+      ordered_calc_shap_tcp$sample_labels,
+      levels = unique(ordered_calc_shap_tcp$sample_labels)
+    )
+    ordered_calc_shap_tcp |>
+      filter(Scan == "AVG") |>
+      mutate(Data = de$data_set_name)
+  }
+)
+ggplot(
+  data = est_dens_data,
+  aes(
+    x = shap_value, colour = Annotation
+  )
+) +
+  facet_grid(Data ~ ClassLabel, scales = "free_y") +
+  geom_density(key_glyph = "path") +
+  labs(
+    x = "Shapley value",
+    colour = "Annotation",
+    y = "Estimated density"
+  ) +
+  theme_bw() +
+  theme(
+    # axis.text = element_text(size = 10),
+    # strip.text = element_text(size = 10),
+    legend.position = "right",
+  )
+```
+
+## Model qualities
+
+### Test dataset
+```{r modelqual}
+alg <- function(data) {
+  if (dim(data)[1] <= 0) {
+    return(NULL)
+  }
+  cat.col.number <- ncol(data)
+  if (length(unique(data[, cat.col.number])) < 2 ||
+    min(table(as.numeric(data[, cat.col.number]))) < 2) {
+    return(NULL)
+  }
+  # посмотреть коэффициенты моделей, сколько там ненулевых.
+  # низкая специфичность - это плохо.
+  # нужно сделать CV, проверять на проверочном наборе.
+  # проверить, что специфичность считается правильно
+  # посмотреть в caret one-class-classifier
+  x <- data[, 1:(cat.col.number - 1)]
+  y <- data[, cat.col.number]
+  model_lambda <-
+    glmnet(as.matrix(x),
+      y,
+      alpha = 1,
+      family = "binomial"
+    )
+  if (is.null(model_lambda)) {
+    cat("Model_lambda is null")
+  }
+  model_lambda
+}
+
+validF <- function(model, test_data) {
+  cat.col.number <- ncol(test_data)
+  if (is.null(model)) {
+    cat("model is null\n")
+    return(
+      list(
+        acc = max(table(test_data[, cat.col.number]) / dim(test_data)[1]),
+        se = max(table(test_data[, cat.col.number]) / dim(test_data)[1]),
+        sp = max(table(test_data[, cat.col.number]) / dim(test_data)[1])
+      )
+    )
+  }
+  AIC <- deviance(model) + 2 * model$df
+  best_s <- which.min(AIC)
+  x_test <- test_data[, 1:(cat.col.number - 1)]
+  y_test <- test_data[, cat.col.number]
+  tumor_id <- levels(y_test)[[which(stri_count_fixed(levels(y_test), "6") > 0)]]
+  nontumor_id <- levels(y_test)[[which(
+    stri_count_fixed(levels(y_test), "32") > 0
+  )]]
+  new_x <- as.matrix(x_test)
+  pred <- as.numeric(predict(
+    model,
+    newx = new_x,
+    type = "class",
+    s = model$lambda[[best_s]]
+  ))
+  conf_matrix <- table(
+    Fact = y_test,
+    Prediction = pred == tumor_id
+  )
+  if (dim(conf_matrix)[[2]] == 1) {
+    dim_name <- attributes(conf_matrix)$dimnames[[2]][[1]]
+    if (dim_name == "TRUE") {
+      tp <- conf_matrix[tumor_id, "TRUE"]
+      tn <- 0
+      fp <- conf_matrix[nontumor_id, "TRUE"]
+      fn <- 0
+    } else {
+      fn <- conf_matrix[tumor_id, "FALSE"]
+      tp <- 0
+      tn <- conf_matrix[nontumor_id, "FALSE"]
+      fp <- 0
+    }
+  } else {
+    tp <- conf_matrix[tumor_id, "TRUE"]
+    tn <- conf_matrix[nontumor_id, "FALSE"]
+    fp <- conf_matrix[nontumor_id, "TRUE"]
+    fn <- conf_matrix[tumor_id, "FALSE"]
+  }
+  list(
+    acc = (tp + tn) / (tp + tn + fp + fn),
+    se = tp / (tp + fn),
+    sp = tn / (fp + tn)
+  )
+}
+models_data  <- ldply(
+  data_envs,
+  function(de) {
+    common_ds_model <- alg(de$train_test_data$shap_train_set)
+    common_valid <- validF(
+      common_ds_model,
+      de$train_test_data$shap_test_set
+    )
+    true_ds <- de$train_test_data$shap_train_set
+    true_ds$class <- as.factor(de$shap_trained_mdT$diagnosis)
+    true_annotation_ds_model  <- alg(true_ds)
+    true_valid <- validF(
+      true_annotation_ds_model,
+      de$train_test_data$shap_test_set
+    )
+    pos_idx <- which(de$shap_calculated > 0)
+    pos_ds <- de$train_test_data$shap_train_set[pos_idx, ]
+    pos_ds$class <- as.factor(de$shap_trained_mdT[pos_idx, "diagnosis"])
+    pos_ds_model  <- alg(pos_ds)
+    pos_valid <- validF(
+      pos_ds_model,
+      de$train_test_data$shap_test_set
+    )
+    data.frame(
+      annotation = c("mixed", "true", "pos_shapley"),
+      acc = c(common_valid$acc, true_valid$acc, pos_valid$acc),
+      se = c(common_valid$se, true_valid$se, pos_valid$se),
+      sp = c(common_valid$sp, true_valid$sp, pos_valid$sp),
+      Data = de$data_set_name
+    )
+  }
+)
+kable(
+  models_data[, seq_len(ncol(models_data) - 1)],
+  format = "latex", caption = "Models quality",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Annotation", "Accuracy", "Sensitivity",
+    "Specificity"
+  )
+) %>%
+  group_rows(index = table(models_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+### Trained shapley with full dataset
+
+```{r modelqualfullds}
+models_data  <- ldply(
+  data_envs,
+  function(de) {
+    # cat(de$cat.col.number, " 1 ", "\n")
+    common_ds_model <- alg(de$train_test_data$shap_train_set)
+    data_set <- as.data.frame(de$all_fm_data$result_fm)
+    data_set$class <- as.factor(de$all_fm_data$result_meta_data[, "diagnosis"])
+    common_valid <- validF(
+      common_ds_model,
+      data_set
+    )
+    # cat(de$cat.col.number, " 2 ", "\n")
+    true_ds <- de$train_test_data$shap_train_set
+    true_ds$class <- as.factor(de$shap_trained_mdT$diagnosis)
+    true_annotation_ds_model  <- alg(true_ds)
+    true_valid <- validF(
+      true_annotation_ds_model,
+      data_set
+    )
+    # cat(de$cat.col.number, " 3 ", "\n")
+    pos_idx <- which(de$shap_calculated > 0)
+    pos_ds <- de$train_test_data$shap_train_set[pos_idx, ]
+    pos_ds$class <- as.factor(de$shap_trained_mdT[pos_idx, "diagnosis"])
+    pos_ds_model  <- alg(pos_ds)
+    pos_valid <- validF(
+      pos_ds_model,
+      data_set
+    )
+    data.frame(
+      annotation = c("mixed", "true", "pos_shapley"),
+      acc = c(common_valid$acc, true_valid$acc, pos_valid$acc),
+      se = c(common_valid$se, true_valid$se, pos_valid$se),
+      sp = c(common_valid$sp, true_valid$sp, pos_valid$sp),
+      Data = de$data_set_name
+    )
+  }
+)
+kable(
+  models_data[, seq_len(ncol(models_data) - 1)],
+  format = "latex", caption = "Models quality (full data set)",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Annotation", "Accuracy", "Sensitivity",
+    "Specificity"
+  )
+) %>%
+  group_rows(index = table(models_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+### Averaged scans' shapley with full dataset
+
+```{r predshapfull}
+
+models_data  <- ldply(
+  data_envs,
+  function(de) {
+    # cat(de$cat.col.number, " 1 ", "\n")
+    pred_shap <- predict(
+      de$rf_model$finalModel,
+      de$all_fm_data$result_fm
+    )
+    de$pred_shap <- pred_shap
+    pos_idx <- which(pred_shap > 0)
+    result_fm_df <- as.data.frame(de$all_fm_data$result_fm)
+    result_fm_df$class <- as.factor(
+      de$all_fm_data$result_meta_data[, "diagnosis"]
+    )
+    pos_ds <- result_fm_df[pos_idx, ]
+    pos_ds_model  <- alg(pos_ds)
+    pos_valid <- validF(
+      pos_ds_model,
+      result_fm_df
+    )
+    data.frame(
+      annotation = c("pos_shapley"),
+      acc = c(pos_valid$acc),
+      se = c(pos_valid$se),
+      sp = c(pos_valid$sp),
+      Datal = de$data_set_name
+    )
+  }
+)
+kable(
+  models_data[, seq_len(ncol(models_data) - 1)],
+  format = "latex", caption = "Averaged scans models quality (full data set)",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Annotation", "Accuracy", "Sensitivity",
+    "Specificity"
+  )
+) %>%
+  group_rows(index = table(models_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+## Model qualities with CV
+
+Без препроцессинга, 5 фолдов с 10 повторениями.
+
+Разделяем на фолды по EMSID.
+
+### Test dataset
+```{r modelqualcv, cache=FALSE}
+models_data_plot  <- lapply(
+  data_envs,
+  function(de) {
+    set.seed(202022026)
+    if (file.exists(file.path(
+        "~",
+        paste0(de$data_set_name, "modelqualcv.RData")
+      ))) {
+      load(file.path(
+        "~",
+        paste0(de$data_set_name, "modelqualcv.RData")
+      ))
+      pos_idx <- which(de$shap_calculated[-not_training_idx] > 0)
+    } else {
+      tissues_data <- de$all_fm_data$result_meta_data |>
+        select(tissue, diagnosis) |>
+        distinct()
+      patients_data <- cbind(
+        tissues_data,
+        get_patient_info(tissues_data$tissue, conn)
+      )
+      patients_data <- patients_data |>
+        mutate(
+          emsid = as.factor(emsid),
+          sex = as.factor(sex),
+          age = if_else(is.na(age), -1, age)
+        )
+      all_meta_data <- left_join(
+        de$all_fm_data$result_meta_data,
+        patients_data |> select(-diagnosis),
+        by = "tissue"
+      )
+      shap_trained_meta_data <- left_join(
+        de$shap_trained_mdT,
+        patients_data |> select(-diagnosis),
+        by = "tissue"
+      )
+      patients_not_trained <- shap_trained_meta_data |>
+        select(emsid, diagnosis) |>
+        distinct() |>
+        slice_sample(n = 4, by = diagnosis)
+
+      not_training_idx <- which(
+        shap_trained_meta_data$emsid %in% patients_not_trained$emsid
+      )
+      data_cv <- cbind(
+        de$train_test_data$shap_train_set[-not_training_idx, ],
+        shap_trained_meta_data$emsid[-not_training_idx]
+      )
+      names(data_cv)[[ncol(data_cv)]] <- "group"
+      validating_idx <- which(
+        all_meta_data$emsid %in% patients_not_trained$emsid
+      )
+      not_trained_df <- as.data.frame(cbind(
+        de$all_fm_data$result_fm[validating_idx, ],
+        de$all_fm_data$result_meta_data[validating_idx, "diagnosis"]
+      ))
+      names(not_trained_df) <- names(de$train_test_data$shap_test_set)
+      test_ds <- not_trained_df
+      names(test_ds) <- names(
+        de$train_test_data$shap_train_set
+      )
+      common_ds_model <- alg_cv(data_cv, k = 5)
+      common_valid <- valid_cv(
+        common_ds_model,
+        test_ds
+      )
+      true_ds <- data_cv
+      true_ds$class <- de$shap_trained_mdT$diagnosis[-not_training_idx]
+      # true_ds$group <- de$shap_trained_mdT$tissue[-not_training_idx]
+      true_annotation_ds_model  <- alg_cv(true_ds, k = 5)
+      true_valid <- valid_cv(
+        true_annotation_ds_model,
+        test_ds
+      )
+      pos_idx <- which(de$shap_calculated[-not_training_idx] > 0)
+      pos_ds <- true_ds[pos_idx, ]
+      pos_ds_model  <- alg_cv(pos_ds, k = 5)
+      pos_valid <- valid_cv(
+        pos_ds_model,
+        test_ds
+      )
+    }
+
+    res_df <- data.frame(
+      annotation = c("Mixed annotation", "True annotation", "Positive Shapley"),
+      acc = c(common_valid$acc, true_valid$acc, pos_valid$acc),
+      se = c(common_valid$se, true_valid$se, pos_valid$se),
+      sp = c(common_valid$sp, true_valid$sp, pos_valid$sp),
+      n_pred = c(
+        common_valid$n_selected, true_valid$n_selected, pos_valid$n_selected
+      ),
+      ROC = c(common_valid$ROC, true_valid$ROC, pos_valid$ROC),
+      Samples = c(nrow(data_cv), nrow(true_ds), nrow(pos_ds)),
+      pval = c(common_valid$p_value, true_valid$p_value, pos_valid$p_value),
+      Data = de$data_set_name
+    )
+    resampling_df <- data.frame(
+      annotation = c("Mixed annotation", "True annotation", "Positive Shapley"),
+      acc = c(
+        common_valid$ext_info$cv_metrics$Acc,
+        true_valid$ext_info$cv_metrics$Acc,
+        pos_valid$ext_info$cv_metrics$Acc
+      ),
+      se = c(
+        common_valid$ext_info$cv_metrics$Sens,
+        true_valid$ext_info$cv_metrics$Sens,
+        pos_valid$ext_info$cv_metrics$Sens
+      ),
+      sp = c(
+        common_valid$ext_info$cv_metrics$Spec,
+        true_valid$ext_info$cv_metrics$Spec,
+        pos_valid$ext_info$cv_metrics$Spec
+      ),
+      ROC = c(
+        common_valid$ext_info$cv_metrics$ROC,
+        true_valid$ext_info$cv_metrics$ROC,
+        pos_valid$ext_info$cv_metrics$ROC
+      ),
+      Data = de$data_set_name
+    )
+    common_resample <- reshape2::melt(
+      common_ds_model$resample[, c(
+        "ROC", "Sens", "Spec", "resample"
+      )], variable.name = "Metric"
+    )
+    common_resample$name <- "Mixed annotation"
+    true_ann_resample <- reshape2::melt(
+      true_annotation_ds_model$resample[, c(
+        "ROC", "Sens", "Spec", "resample"
+      )], variable.name = "Metric"
+    )
+    true_ann_resample$name <- "True annotation"
+    pos_resample <- reshape2::melt(
+      pos_ds_model$resample[, c(
+        "ROC", "Sens", "Spec", "resample"
+      )], variable.name = "Metric"
+    )
+    pos_resample$name <- "Positive Shapley"
+    all_resample <- bind_rows(common_resample, true_ann_resample, pos_resample)
+    all_resample$name <- factor(
+      all_resample$name,
+      levels = c("Mixed annotation", "True annotation", "Positive Shapley")
+    )
+    common_resample2 <- reshape2::melt(
+      common_ds_model$resample[, c(
+        "Samples", "TestSize", "PosClassRatio", "n_preds", "resample"
+      )], variable.name = "Metric"
+    )
+    common_resample2$name <- "Mixed annotation"
+    true_ann_resample2 <- reshape2::melt(
+      true_annotation_ds_model$resample[, c(
+        "Samples", "TestSize", "PosClassRatio", "n_preds", "resample"
+      )], variable.name = "Metric"
+    )
+    true_ann_resample2$name <- "True annotation"
+    pos_resample2 <- reshape2::melt(
+      pos_ds_model$resample[, c(
+        "Samples", "TestSize", "PosClassRatio", "n_preds", "resample"
+      )], variable.name = "Metric"
+    )
+    pos_resample2$name <- "Positive Shapley"
+    all_resample2 <- bind_rows(
+      common_resample2, true_ann_resample2, pos_resample2
+    )
+    all_resample2$name <- factor(
+      all_resample2$name,
+      levels = c("Mixed annotation", "True annotation", "Positive Shapley")
+    )
+    # p <- my_dotplot(all_resample)
+    common_valid$ext_info$data_set <- "Mixed annotation"
+    true_valid$ext_info$data_set <- "True annotation"
+    pos_valid$ext_info$data_set <- "Positive Shapley"
+
+    common_valid$ext_info$exp_mode <- de$data_set_name
+    true_valid$ext_info$exp_mode <- de$data_set_name
+    pos_valid$ext_info$exp_mode <- de$data_set_name
+    p_roc <- rbind(
+      data.frame(
+        fpr = 1 - common_valid$ext_info$roc$specificities,
+        tpr = common_valid$ext_info$roc$sensitivities,
+        data_set = common_valid$ext_info$data_set,
+        exp_mode = common_valid$ext_info$exp_mode,
+        auc = round(common_valid$ext_info$auc, 3)
+      ),
+      data.frame(
+        fpr = 1 - true_valid$ext_info$roc$specificities,
+        tpr = true_valid$ext_info$roc$sensitivities,
+        data_set = true_valid$ext_info$data_set,
+        exp_mode = true_valid$ext_info$exp_mode,
+        auc = round(true_valid$ext_info$auc, 3)
+      ),
+      data.frame(
+        fpr = 1 - pos_valid$ext_info$roc$specificities,
+        tpr = pos_valid$ext_info$roc$sensitivities,
+        data_set = pos_valid$ext_info$data_set,
+        exp_mode = pos_valid$ext_info$exp_mode,
+        auc = round(pos_valid$ext_info$auc, 3)
+      )
+    )
+    tissue_shap_df <- bind_rows(
+      data.frame(
+        tissue = data_cv$group,
+        shapley = de$shap_calculated[-not_training_idx],
+        ds = "Mixed annotation"
+      ),
+      data.frame(
+        tissue = true_ds$group,
+        shapley = de$shap_calculated[-not_training_idx],
+        ds = "True annotation"
+      ),
+      data.frame(
+        tissue = pos_ds$group,
+        shapley = de$shap_calculated[-not_training_idx][pos_idx],
+        ds = "Positive Shapley"
+      )
+    ) |>
+      mutate(
+        tissue = as.factor(tissue),
+        ds = as.factor(ds), exp_mode = de$data_set_name
+      )
+    if (!file.exists(
+      file.path(
+          "~",
+          paste0(de$data_set_name, "modelqualcv.RData"))
+    )) {
+      save(
+        de, res_df, tissue_shap_df,
+        p_roc, not_training_idx, all_meta_data,
+        patients_data, patients_not_trained,
+        data_cv, test_ds, common_ds_model, common_valid,
+        true_ds, true_annotation_ds_model, true_valid,
+        pos_ds, pos_ds_model, pos_valid,
+        file = file.path(
+          "~",
+          paste0(de$data_set_name, "modelqualcv.RData")
+        )
+      )
+    }
+
+    list(
+      df = res_df,
+      plot_data = all_resample,
+      roc_plot = p_roc,
+      resampling_df = resampling_df,
+      plot_data2 = all_resample2,
+      tissue_shap_df = tissue_shap_df
+    )
+  }
+)
+models_data <- ldply(
+  models_data_plot,
+  function(mdp) mdp$df
+)
+kable(
+  models_data[, seq_len(ncol(models_data) - 1)],
+  format = "latex", caption = "Models quality",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Annotation", "Accuracy", "Sensitivity",
+    "Specificity", "NPreds", "ROC", "Samples", "PVal"
+  )
+) %>%
+  group_rows(index = table(models_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+
+resampling_data <- ldply(
+  models_data_plot,
+  function(mdp) mdp$resampling_df
+)
+kable(
+  resampling_data[, seq_len(ncol(resampling_data) - 1)],
+  format = "latex", caption = "Resampling metrics",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Annotation", "Accuracy", "Sensitivity",
+    "Specificity", "ROC"
+  )
+) %>%
+  group_rows(index = table(resampling_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+```{r modelqualcvplotcommon, dev="cairo_pdf", results="asis", fig.width=8, fig.align = "center", cache=FALSE}
+cv_plot_data <- ldply(models_data_plot, function(mdp) {
+  .data <- mdp$plot_data
+  .data$ds <- mdp$df$Data
+  .data
+})
+cv_plot_data$ds <- as.factor(cv_plot_data$ds)
+my_dotplot(
+  cv_plot_data,
+  paste0(
+    "Models 5-folds resampling metrics. ",
+    "Accuracy was calculated at the probability threshold under 0.5."
+  )
+)
+```
+
+```{r modelqualcvplotcommon2, dev="cairo_pdf", results="asis", fig.width=8, fig.align = "center", cache=FALSE}
+cv_plot_data <- ldply(models_data_plot, function(mdp) {
+  .data <- mdp$plot_data2
+  .data$ds <- mdp$df$Data
+  .data
+})
+cv_plot_data$ds <- as.factor(cv_plot_data$ds)
+my_dotplot(
+  cv_plot_data,
+  paste0(
+    "Resampling data set stats"
+  ), "free_x"
+)
+```
+
+```{r modelqualcvrocplot, dev="cairo_pdf", fig.height=6, fig.width=8, fig.align = "center", cache=FALSE}
+roc_data <- ldply(models_data_plot, function(mdp) {
+  mdp$roc_plot
+})
+auc_labels <- roc_data %>%
+  distinct(data_set, auc, exp_mode) %>%
+  mutate(
+      x = 0.5,
+      y = seq(0.3, 0.1, length.out = n())
+  )
+ggplot(roc_data, aes(x = fpr, y = tpr, color = data_set)) +
+  facet_wrap(exp_mode ~ ., scales = "fixed") +
+  # ROC-кривая
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, 
+              linetype = "dashed", color = "gray40") +
+  geom_text(
+    data = auc_labels,
+    aes(x = x, y = y, 
+        label = paste0(data_set, " (AUC = ", auc, ")"),
+        color = data_set),
+    size = 3,
+    hjust = 0,
+    fontface = "bold",
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(limits = c(0, 1), labels = scales::percent) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  coord_equal() +
+  labs(
+    caption = "Сравнение ROC-кривых",
+    x = "False Positive Rate",
+    y = "True Positive Rate",
+    color = "Датасет"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r tissueshapplot, dev="cairo_pdf", fig.height=6, fig.width=8, fig.align = "center", cache=FALSE}
+tshap_data <- ldply(models_data_plot, function(mdp) {
+  mdp$tissue_shap_df
+})
+ggplot(tshap_data) +
+  facet_wrap(exp_mode ~ ., scales = "fixed") +
+  geom_violin(aes(x = shapley, y = ds), width = 0.4) +
+  labs(
+    caption = "Datasets with Shapley values distribution",
+    x = "Shapley value",
+    y = "Data set"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+```
+
+### Averaged scans' shapley with full dataset
+
+По рассчитанным Shapley предсказываем значения для всех данных.
+
+Данные делим на обучающую и проверочную выборки (3:1), строим модель с кросс-валидацией и проверяем модель.
+
+Сравниваем модели на всех Shapley-значениях и на только положительных Shapley.
+```{r predshapfullcv, cache=FALSE}
+models_data_plot  <- lapply(
+  data_envs,
+  function(de) {
+    set.seed(202022026)
+    if (file.exists(file.path(
+      "~",
+      paste0(de$data_set_name, "predshapfullcv.RData")))) {
+      load(file.path(
+        "~",
+        paste0(de$data_set_name, "predshapfullcv.RData")
+      ))
+      not_training_idx <- which(
+        all_meta_data$emsid %in% emsid_not_trained
+      )
+      pred_shap <- predict(
+        de$rf_model$finalModel,
+        de$all_fm_data$result_fm[-not_training_idx, ]
+      )
+      pos_idx <- which(pred_shap > 0)
+    } else {
+      tissues_data <- de$all_fm_data$result_meta_data |>
+        select(tissue, diagnosis) |>
+        distinct()
+      patients_data <- cbind(
+        tissues_data,
+        get_patient_info(tissues_data$tissue, conn)
+      )
+      patients_data <- patients_data |>
+        mutate(
+          emsid = as.factor(emsid),
+          sex = as.factor(sex),
+          age = if_else(is.na(age), -1, age)
+        )
+      all_meta_data <- left_join(
+        de$all_fm_data$result_meta_data,
+        patients_data |> select(-diagnosis),
+        by = "tissue"
+      )
+      patients_by_diags <- all_meta_data |>
+        select(emsid, diagnosis) |>
+        distinct()
+      patients_by_diags <- patients_by_diags |>
+        mutate(
+          probs = n() / nrow(patients_by_diags),
+          .by = diagnosis
+        )
+      emsid_not_trained <- sample(
+        patients_by_diags$emsid, prob = patients_by_diags$probs, size = 8
+      )
+
+      not_training_idx <- which(
+        all_meta_data$emsid %in% emsid_not_trained
+      )
+      result_fm_df <- as.data.frame(de$all_fm_data$result_fm[-not_training_idx, ])
+      pred_shap <- de$pred_shap[-not_training_idx, ]
+      result_fm_df$class <- de$all_fm_data$result_meta_data[
+        -not_training_idx, "diagnosis"
+      ]
+      result_fm_df$group <- all_meta_data$emsid[
+        -not_training_idx
+      ]
+      train_groups <- sample(
+        unique(result_fm_df$group),
+        size = length(unique((result_fm_df$group))) * 0.75
+      )
+      train_idx <- which(result_fm_df$group %in% train_groups)
+      test_ds <- as.data.frame(de$all_fm_data$result_fm[not_training_idx, ])
+      test_ds$class <- de$all_fm_data$result_meta_data[
+        not_training_idx, "diagnosis"
+      ]
+      common_ds_model  <- alg_cv(result_fm_df, k = 5)
+      common_valid <- valid_cv(
+        common_ds_model,
+        test_ds
+      )
+
+      pos_idx <- which(pred_shap > 0)
+      pos_ds <- result_fm_df[pos_idx, ]
+      pos_ds_model  <- alg_cv(pos_ds, k = 5)
+      pos_valid <- valid_cv(
+        pos_ds_model,
+        test_ds
+      )
+    }
+
+    res_df <- data.frame(
+      annotation = c("All data", "Positive Shapley"),
+      acc = c(common_valid$acc, pos_valid$acc),
+      se = c(common_valid$se, pos_valid$se),
+      sp = c(common_valid$sp, pos_valid$sp),
+      n_pred = c(
+        common_valid$n_selected, pos_valid$n_selected
+      ),
+      ROC = c(common_valid$ROC, pos_valid$ROC),
+      Samples = c(nrow(result_fm_df), nrow(pos_ds)),
+      pval = c(common_valid$p_value, pos_valid$p_value),
+      Data = de$data_set_name
+    )
+    resampling_df <- data.frame(
+      annotation = c("Mixed annotation", "Positive Shapley"),
+      acc = c(
+        common_valid$ext_info$cv_metrics$Acc,
+        pos_valid$ext_info$cv_metrics$Acc
+      ),
+      se = c(
+        common_valid$ext_info$cv_metrics$Sens,
+        pos_valid$ext_info$cv_metrics$Sens
+      ),
+      sp = c(
+        common_valid$ext_info$cv_metrics$Spec,
+        pos_valid$ext_info$cv_metrics$Spec
+      ),
+      ROC = c(
+        common_valid$ext_info$cv_metrics$ROC,
+        pos_valid$ext_info$cv_metrics$ROC
+      ),
+      Data = de$data_set_name
+    )
+    common_resample <- reshape2::melt(
+      common_ds_model$resample[, c(
+        "ROC", "Sens", "Spec", "resample"
+      )], variable.name = "Metric"
+    )
+    common_resample$name <- "All data"
+    pos_resample <- reshape2::melt(
+      pos_ds_model$resample[, c(
+        "ROC", "Sens", "Spec", "resample"
+      )], variable.name = "Metric"
+    )
+    pos_resample$name <- "Positive Shapley"
+    all_resample <- bind_rows(common_resample, pos_resample)
+    all_resample$name <- factor(
+      all_resample$name,
+      levels = c("All data", "Positive Shapley")
+    )
+    common_resample2 <- reshape2::melt(
+      common_ds_model$resample[, c(
+        "Samples", "TestSize", "PosClassRatio", "n_preds", "resample"
+      )], variable.name = "Metric"
+    )
+    common_resample2$name <- "All data"
+    pos_resample2 <- reshape2::melt(
+      pos_ds_model$resample[, c(
+        "Samples", "TestSize", "PosClassRatio", "n_preds", "resample"
+      )], variable.name = "Metric"
+    )
+    pos_resample2$name <- "Positive Shapley"
+    all_resample2 <- bind_rows(common_resample2, pos_resample2)
+    all_resample2$name <- factor(
+      all_resample2$name,
+      levels = c("All data", "Positive Shapley")
+    )
+    common_valid$ext_info$data_set <- "All data"
+    pos_valid$ext_info$data_set <- "Positive Shapley"
+
+    common_valid$ext_info$exp_mode <- de$data_set_name
+    pos_valid$ext_info$exp_mode <- de$data_set_name
+    p_roc <- rbind(
+      data.frame(
+        fpr = 1 - common_valid$ext_info$roc$specificities,
+        tpr = common_valid$ext_info$roc$sensitivities,
+        data_set = common_valid$ext_info$data_set,
+        exp_mode = common_valid$ext_info$exp_mode,
+        auc = round(common_valid$ext_info$auc, 3)
+      ),
+      data.frame(
+        fpr = 1 - pos_valid$ext_info$roc$specificities,
+        tpr = pos_valid$ext_info$roc$sensitivities,
+        data_set = pos_valid$ext_info$data_set,
+        exp_mode = pos_valid$ext_info$exp_mode,
+        auc = round(pos_valid$ext_info$auc, 3)
+      )
+    )
+    tissue_shap_df <- bind_rows(
+      data.frame(
+        tissue = result_fm_df$group,
+        shapley = pred_shap,
+        ds = "All data"
+      ),
+      data.frame(
+        tissue = pos_ds$group,
+        shapley = pred_shap[pos_idx],
+        ds = "Positive Shapley"
+      )
+    ) |>
+      mutate(
+        tissue = as.factor(tissue),
+        ds = as.factor(ds), exp_mode = de$data_set_name
+      )
+    if (!file.exists(file.path(
+        "~",
+        paste0(de$data_set_name, "predshapfullcv.RData")))) {
+      save(
+        de, res_df, pred_shap, tissue_shap_df,
+        p_roc, all_meta_data,
+        patients_data, test_ds, emsid_not_trained,
+        result_fm_df, train_groups, train_idx, common_ds_model, common_valid,
+        pos_ds, pos_ds_model, pos_valid,
+        file = file.path(
+          "~",
+          paste0(de$data_set_name, "predshapfullcv.RData"))
+      )          
+    }
+
+    list(
+      df = res_df,
+      # plot = p,
+      plot_data = all_resample,
+      roc_plot = p_roc,
+      resampling_df = resampling_df,
+      plot_data2 = all_resample2,
+      tissue_shap_df = tissue_shap_df
+    )
+  }
+)
+models_data <- ldply(
+  models_data_plot,
+  function(mdp) mdp$df
+)
+kable(
+  models_data[, seq_len(ncol(models_data) - 1)],
+  format = "latex", caption = "Averaged scans models quality (full data set)",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Annotation", "Accuracy", "Sensitivity",
+    "Specificity", "NPreds", "ROC", "Samples", "PVal"
+  )
+) %>%
+  group_rows(index = table(models_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+
+resampling_data <- ldply(
+  models_data_plot,
+  function(mdp) mdp$resampling_df
+)
+kable(
+  resampling_data[, seq_len(ncol(resampling_data) - 1)],
+  format = "latex", caption = "Resampling metrics",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Annotation", "Accuracy", "Sensitivity",
+    "Specificity", "ROC"
+  )
+) %>%
+  group_rows(index = table(resampling_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+```{r predmodelqualcvplotcommon, dev="cairo_pdf", results="asis", fig.width=8, fig.align = "center", cache=FALSE}
+cv_plot_data <- ldply(models_data_plot, function(mdp) {
+  .data <- mdp$plot_data
+  .data$ds <- mdp$df$Data
+  .data
+})
+cv_plot_data$ds <- as.factor(cv_plot_data$ds)
+my_dotplot(
+  cv_plot_data,
+  paste0(
+    "Models 5-folds resampling metrics. ",
+    "Accuracy was calculated at the probability threshold under 0.5."
+  )
+)
+```
+
+```{r predmodelqualcvplotcommon2, dev="cairo_pdf", results="asis", fig.width=8, fig.align = "center", cache=FALSE}
+cv_plot_data <- ldply(models_data_plot, function(mdp) {
+  .data <- mdp$plot_data2
+  .data$ds <- mdp$df$Data
+  .data
+})
+cv_plot_data$ds <- as.factor(cv_plot_data$ds)
+my_dotplot(
+  cv_plot_data,
+  paste0(
+    "Resampling data set stats"
+  ), "free_x"
+)
+```
+
+```{r modelqualcvrocplotpredshap, dev="cairo_pdf", fig.height=6, fig.width=8, fig.align = "center"}
+roc_data <- ldply(models_data_plot, function(mdp) {
+  mdp$roc_plot
+})
+auc_labels <- roc_data %>%
+    distinct(data_set, auc, exp_mode) %>%
+    mutate(
+        x = 0.5,
+        y = seq(0.3, 0.1, length.out = n())
+    )
+ggplot(roc_data, aes(x = fpr, y = tpr, color = data_set)) +
+  facet_wrap(exp_mode ~ ., scales = "fixed") +
+  # ROC-кривая
+  geom_line() +
+    geom_abline(intercept = 0, slope = 1, 
+                linetype = "dashed", color = "gray40") +
+    geom_text(
+        data = auc_labels,
+        aes(x = x, y = y, 
+            label = paste0(data_set, " (AUC = ", auc, ")"),
+            color = data_set),
+        size = 3,
+        hjust = 0,
+        fontface = "bold",
+        show.legend = FALSE
+    ) +
+    scale_x_continuous(limits = c(0, 1), labels = scales::percent) +
+    scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+    coord_equal() +
+    labs(
+        caption = "Сравнение ROC-кривых",
+        x = "False Positive Rate",
+        y = "True Positive Rate",
+        color = "Датасет"
+    ) +
+    theme_bw() +
+    theme(
+        legend.position = "none",
+        plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+        panel.grid.minor = element_blank()
+    )
+```
+
+```{r tissuepredshapplot, dev="cairo_pdf", fig.height=6, fig.width=8, fig.align = "center", cache=FALSE}
+tshap_data <- ldply(models_data_plot, function(mdp) {
+  mdp$tissue_shap_df
+})
+ggplot(tshap_data) +
+  facet_wrap(exp_mode ~ ., scales = "fixed") +
+  geom_violin(aes(x = shapley, y = ds), width = 0.4) +
+  labs(
+    caption = "Datasets with Shapley values distribution",
+    x = "Shapley value",
+    y = "Data set"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+```
+
+### Downsampling
+
+Perform downsampling with 10 repeats.
+
+```{r modelqualcvdns, cache=FALSE}
+repeats <- 10
+downsmpl_length <- 700
+
+train_validate_downsampling <- function(
+  data_cv, test_ds, repeats = 10, downsmpl_length = 700
+) {
+  downsmpl_data <- lapply(seq_len(repeats), function(i) {
+    tr_samples_idx <- sample(
+      seq_len(nrow(data_cv)), size = downsmpl_length
+    )
+    ds_model <- alg_cv(data_cv[tr_samples_idx, ], k = 5)
+    list(
+      model_data = ds_model,
+      validation_data = valid_cv(
+        ds_model,
+        test_ds
+      )
+    )
+  })
+  model_metrics <- ldply(seq_along(downsmpl_data), function(dcd_idx) {
+    dcd <- downsmpl_data[[dcd_idx]]$validation_data
+    data.frame(
+      rep = dcd_idx,
+      acc = dcd$acc,
+      se = dcd$se,
+      sp = dcd$sp,
+      n_pred = dcd$n_selected,
+      ROC = dcd$ROC,
+      NSR = dcd$ext_info$neg_shap_ratio
+    )
+  })
+  model_roc <- ldply(seq_along(downsmpl_data), function(dcd_idx) {
+    dcd <- downsmpl_data[[dcd_idx]]
+    dcd$model_data$resample |>
+      select(ROC, resample) |>
+      mutate(rep = dcd_idx)
+  })
+  model_predictors <- ldply(seq_along(downsmpl_data), function(dcd_idx) {
+    dcd <- downsmpl_data[[dcd_idx]]
+    reshape2::melt(
+      dcd$model_data$bestModel_predictors,
+      id.vars = c("class"),
+      variable.name = "MZ",
+      value.name = "intensity"
+    ) |>
+      mutate(rep = dcd_idx)
+  })
+  proc <- ldply(seq_along(downsmpl_data), function(dcd_idx) {
+    dcd <- downsmpl_data[[dcd_idx]]$validation_data
+    data.frame(
+      rep = dcd_idx,
+      fpr = 1 - dcd$ext_info$roc$specificities,
+      tpr = dcd$ext_info$roc$sensitivities,
+      auc = round(dcd$ext_info$auc, 3)
+    )
+  })
+  list(
+    model_metrics = model_metrics,
+    summary = colMeans(model_metrics),
+    roc = model_roc,
+    proc = proc,
+    predictors = model_predictors
+  )
+}
+
+models_data_plot  <- lapply(
+  data_envs,
+  function(de) {
+    set.seed(202022026)
+    samples_cnt <- ifelse(
+      de$data_set_name == "Negative", 700, 300
+    )
+    if (file.exists(
+      file.path(
+        "~",
+        paste0(de$data_set_name, "modelqualcv_downsmpl.RData")
+      )
+    )) {
+      load(file.path(
+        "~",
+        paste0(de$data_set_name, "modelqualcv_downsmpl.RData")
+      ))
+    } else {
+      tissues_data <- de$all_fm_data$result_meta_data |>
+        select(tissue, diagnosis) |>
+        distinct()
+      patients_data <- cbind(
+        tissues_data,
+        get_patient_info(tissues_data$tissue, conn)
+      )
+      patients_data <- patients_data |>
+        mutate(
+          emsid = as.factor(emsid),
+          sex = as.factor(sex),
+          age = if_else(is.na(age), -1, age)
+        )
+      all_meta_data <- left_join(
+        de$all_fm_data$result_meta_data,
+        patients_data |> select(-diagnosis),
+        by = "tissue"
+      )
+      shap_trained_meta_data <- left_join(
+        de$shap_trained_mdT,
+        patients_data |> select(-diagnosis),
+        by = "tissue"
+      )
+      patients_not_trained <- shap_trained_meta_data |>
+        select(emsid, diagnosis) |>
+        distinct() |>
+        slice_sample(n = 4, by = diagnosis)
+
+      not_training_idx <- which(
+        shap_trained_meta_data$emsid %in% patients_not_trained$emsid
+      )
+      data_cv <- de$train_test_data$shap_train_set[-not_training_idx, ] |>
+        mutate(
+          group = shap_trained_meta_data$emsid[-not_training_idx],
+          shapley = de$shap_calculated[-not_training_idx]
+        )
+      validating_idx <- which(
+        all_meta_data$emsid %in% patients_not_trained$emsid
+      )
+      not_trained_df <- as.data.frame(cbind(
+        de$all_fm_data$result_fm[validating_idx, ],
+        de$all_fm_data$result_meta_data[validating_idx, "diagnosis"]
+      ))
+      names(not_trained_df) <- names(de$train_test_data$shap_test_set)
+      test_ds <- not_trained_df
+      names(test_ds) <- names(
+        de$train_test_data$shap_train_set
+      )
+      true_ds <- data_cv
+      true_ds$class <- de$shap_trained_mdT$diagnosis[-not_training_idx]
+      pos_idx <- which(de$shap_calculated[-not_training_idx] > 0)
+      pos_ds <- true_ds[pos_idx, ]
+      samples_cnt <- min(
+        nrow(data_cv), nrow(true_ds), nrow(pos_ds)
+      )
+
+      downsmpl_common_data <- train_validate_downsampling(
+        data_cv, test_ds,
+        downsmpl_length = samples_cnt
+      )
+      
+      downsmpl_true_data <- train_validate_downsampling(
+        true_ds, test_ds,
+        downsmpl_length = samples_cnt
+      )
+      
+      downsmpl_pos_data <- train_validate_downsampling(
+        pos_ds, test_ds,
+        downsmpl_length = samples_cnt
+      )
+      res_df <- data.frame(
+        annotation = c(
+          "Mixed annotation", "True annotation", "Positive Shapley"
+        ),
+        acc = c(
+          downsmpl_common_data$summary[["acc"]],
+          downsmpl_true_data$summary[["acc"]],
+          downsmpl_pos_data$summary[["acc"]]
+        ),
+        se = c(
+          downsmpl_common_data$summary[["se"]],
+          downsmpl_true_data$summary[["se"]],
+          downsmpl_pos_data$summary[["se"]]
+        ),
+        sp = c(
+          downsmpl_common_data$summary[["sp"]],
+          downsmpl_true_data$summary[["sp"]],
+          downsmpl_pos_data$summary[["sp"]]
+        ),
+        n_pred = c(
+          downsmpl_common_data$summary[["n_pred"]],
+          downsmpl_true_data$summary[["n_pred"]],
+          downsmpl_pos_data$summary[["n_pred"]]
+        ),
+        ROC = c(
+          downsmpl_common_data$summary[["ROC"]],
+          downsmpl_true_data$summary[["ROC"]],
+          downsmpl_pos_data$summary[["ROC"]]
+        ),
+        NSR = c(
+          downsmpl_common_data$summary[["NSR"]],
+          downsmpl_true_data$summary[["NSR"]],
+          downsmpl_pos_data$summary[["NSR"]]
+        ),
+        Samples = c(samples_cnt, samples_cnt, samples_cnt),
+        Data = de$data_set_name
+      )
+      resampling_df <- rbind(
+        downsmpl_common_data$model_metrics |>
+          mutate(
+            annotation = "Mixed annotation",
+            Data = de$data_set_name
+          ),
+        downsmpl_true_data$model_metrics |>
+          mutate(
+            annotation = "True annotation",
+            Data = de$data_set_name
+          ),
+        downsmpl_pos_data$model_metrics |>
+          mutate(
+            annotation = "Positive Shapley",
+            Data = de$data_set_name
+          )
+      )
+      common_resample <- reshape2::melt(
+        downsmpl_common_data$roc, variable.name = "Metric"
+      )
+      common_resample$name <- "Mixed annotation"
+      true_ann_resample <- reshape2::melt(
+        downsmpl_true_data$roc, variable.name = "Metric"
+      )
+      true_ann_resample$name <- "True annotation"
+      pos_resample <- reshape2::melt(
+        downsmpl_pos_data$roc, variable.name = "Metric"
+      )
+      pos_resample$name <- "Positive Shapley"
+      all_resample <- bind_rows(
+        common_resample, true_ann_resample, pos_resample
+      )
+      all_resample$name <- factor(
+        all_resample$name,
+        levels = c("Mixed annotation", "True annotation", "Positive Shapley")
+      )
+
+      p_roc <- rbind(
+        downsmpl_common_data$proc |>
+          mutate(
+            data_set = "Mixed annotation",
+            exp_mode = de$data_set_name
+          ),
+        downsmpl_true_data$proc |>
+          mutate(
+            data_set = "True annotation",
+            exp_mode = de$data_set_name
+          ),
+        downsmpl_pos_data$proc |>
+          mutate(
+            data_set = "Positive Shapley",
+            exp_mode = de$data_set_name
+          )
+      )
+      p_roc$data_set <- factor(
+        p_roc$data_set,
+        levels = c("Mixed annotation", "True annotation", "Positive Shapley")
+      )
+      all_preds <- rbind(
+        downsmpl_common_data$predictors |>
+          mutate(
+            data_set = "Mixed annotation",
+            exp_mode = de$data_set_name
+          ),
+        downsmpl_true_data$predictors |>
+          mutate(
+            data_set = "True annotation",
+            exp_mode = de$data_set_name
+          ),
+        downsmpl_pos_data$predictors |>
+          mutate(
+            data_set = "Positive Shapley",
+            exp_mode = de$data_set_name
+          )
+      )
+      all_preds$data_set <- factor(
+        all_preds$data_set,
+        levels = c("Mixed annotation", "True annotation", "Positive Shapley")
+      )
+      all_preds <- all_preds |>
+        mutate(
+          max_int = max(intensity), .by = MZ
+        )
+      mu <- mean(all_preds$max_int)
+      sigma <- sd(all_preds$max_int)
+      all_preds$group <- cut(
+        all_preds$max_int,
+        breaks = c(-Inf, mu - sigma, mu, mu + sigma, Inf),
+        labels = c("VeryLow", "BelowMedian", "Median", "AboveMedian"),
+        include.lowest = TRUE
+      )
+      save(
+        de, res_df, resampling_df,
+        p_roc, not_training_idx, all_meta_data,
+        patients_data, patients_not_trained,
+        data_cv, test_ds, downsmpl_common_data,
+        true_ds, downsmpl_true_data, all_resample,
+        pos_ds, downsmpl_pos_data, all_preds,
+        file = file.path(
+          "~",
+          paste0(de$data_set_name, "modelqualcv_downsmpl.RData")
+        )
+      )
+    }
+    list(
+      df = res_df,
+      plot_data = all_resample,
+      roc_plot = p_roc,
+      resampling_df = resampling_df,
+      all_preds = all_preds
+    )
+  }
+)
+models_data <- ldply(
+  models_data_plot,
+  function(mdp) mdp$df
+)
+kable(
+  models_data[, seq_len(ncol(models_data) - 1)],
+  format = "latex", caption = "Mean models quality",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Annotation", "Accuracy", "Sensitivity",
+    "Specificity", "NPreds", "ROC", "NSR", "Samples"
+  )
+) %>%
+  group_rows(index = table(models_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+```{r plotmetricsdownsmpl, dev="cairo_pdf", fig.width=8, fig.align="center", cache=FALSE}
+resampling_data <- ldply(
+  models_data_plot,
+  function(mdp) mdp$resampling_df
+)
+plot_data <- reshape2::melt(
+  resampling_data |>
+    select(!c(ROC, n_pred, NSR)),
+  id.vars = c("Data", "annotation", "rep"),
+  variable.name = "Metric"
+)
+plot_data$annotation <- factor(
+  plot_data$annotation,
+  levels = c("Mixed annotation", "True annotation", "Positive Shapley")
+)
+ggplot(
+  plot_data,
+  aes(value, annotation)
+) +
+  facet_grid(. ~ Metric, scales = "free_x") +
+  geom_boxplot(aes(color = Data), width = 0.4) +
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 15)) +
+  # Подписи
+  labs(
+    caption = "Metrics distribution",
+    x = "Metric value",
+    y = NULL,
+    color = "Ions"
+  ) +
+  # Тема
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 10),
+    # strip.text = element_text(size = 12, face = "bold", color = "white"),
+    # strip.background = element_rect(fill = "#2c3e50", color = NA),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.spacing = unit(1, "lines")
+  )
+```
+
+```{r plotmetricsdownsmpl2, dev="cairo_pdf", fig.width=8, fig.align="center", cache=FALSE}
+plot_data <- reshape2::melt(
+  resampling_data |>
+    select(!c(acc, se, sp)),
+  id.vars = c("Data", "annotation", "rep"),
+  variable.name = "Metric"
+)
+plot_data$annotation <- factor(
+  plot_data$annotation,
+  levels = c("Mixed annotation", "True annotation", "Positive Shapley")
+)
+ggplot(
+  plot_data,
+  aes(value, annotation)
+) +
+  facet_grid(. ~ Metric, scales = "free_x") +
+  geom_boxplot(aes(color = Data), width = 0.4) +
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 15)) +
+  # Подписи
+  labs(
+    caption = "ROC with NPreds distribution",
+    x = "Metric value",
+    y = NULL,
+    color = "Ions"
+  ) +
+  # Тема
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 10),
+    # strip.text = element_text(size = 12, face = "bold", color = "white"),
+    # strip.background = element_rect(fill = "#2c3e50", color = NA),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.spacing = unit(1, "lines")
+  )
+```
+
+```{r modelqualcvplotcommondns, dev="cairo_pdf", results="asis", fig.width=8, fig.align = "center", cache=FALSE}
+cv_plot_data <- ldply(models_data_plot, function(mdp) {
+  .data <- mdp$plot_data
+  .data$ds <- mdp$df$Data
+  .data
+})
+cv_plot_data$ds <- as.factor(cv_plot_data$ds)
+my_dotplot(
+  cv_plot_data,
+  paste0(
+    "Models 5-folds resampling metrics. ",
+    "Probability threshold: 0.5."
+  )
+)
+```
+
+```{r modelqualcvrocplotdns, dev="cairo_pdf", fig.height=6, fig.width=8, fig.align = "center", cache=FALSE}
+roc_data <- ldply(models_data_plot, function(mdp) {
+  mdp$roc_plot
+})
+auc_labels <- roc_data |>
+  summarise(
+    max = max(auc),
+    min = min(auc),
+    mean = round(mean(auc), digits = 3),
+    sd = round(sd(auc), digits = 3), .by = c(exp_mode, data_set)
+  ) |>
+  mutate(
+      # Позиция для подписи (можно настроить)
+      x = 0.5,
+      y = 0.3
+  )
+roc_data$rep <- as.factor(roc_data$rep)
+data_tb <- tibble::tibble(
+  x = "right", y = "bottom",
+  tb = lapply(seq_len(nrow(auc_labels)), function(i) {
+    auc_labels[i, ] |> select(min, max, mean, sd)
+  }),
+  data_set = auc_labels$data_set,
+  exp_mode = auc_labels$exp_mode
+)
+ggplot(roc_data, aes(x = fpr, y = tpr, color = rep)) +
+  facet_grid(exp_mode ~ data_set, scales = "fixed") +
+  # ROC-кривая
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, 
+              linetype = "dashed", color = "gray40") +
+  geom_table_npc(
+    data = data_tb,
+    aes(npcx = x, npcy = y, label = tb),
+    parse = TRUE,
+    table.colnames = TRUE,
+    table.theme = ttheme_gtlight
+  ) +
+  scale_x_continuous(limits = c(0, 1), labels = scales::percent) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  coord_equal() +
+  labs(
+    caption = "Сравнение ROC-кривых",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)",
+    color = "Датасет"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+roc_data <- lapply(models_data_plot, function(mdp) {
+  all_preds <- mdp$all_preds
+  all_preds$mz_fact <- factor(
+    all_preds$MZ, levels = sort(unique(levels(all_preds$MZ)))
+  )
+  exp_mode <- unique(all_preds$exp_mode)
+  groups <- levels(all_preds$group)
+  lapply(seq_along(groups), function(gid) {
+    g_file_path <- file.path(
+      "~",
+      paste0(
+        exp_mode, "_calc_predictors_",
+        groups[gid], ".pdf"
+      )
+    )
+    cairo_pdf(filename = g_file_path, width = 8, height = 20)
+    if (nrow(all_preds |> filter(group == groups[gid])) > 0) {
+      print(ggplot(all_preds |> filter(group == groups[gid])) +
+        labs(
+          title = paste("Predictors", groups[gid], "intens")
+        ) +
+        facet_grid(. ~ data_set) +
+        geom_violin(aes(y = mz_fact, color = class, x = intensity)) +
+        labs(
+          y = "MZ"
+        ) +
+        theme_bw() +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+        ))
+    }
+    dev.off()
+  })
+  breaks <- quantile(
+    as.numeric(levels(all_preds$MZ)), probs = seq(0, 1, length.out = 4)
+  )
+  labels <- paste0(
+    "(",
+    format(head(breaks, -1), digits = 5), ", ",
+    format(tail(breaks, -1), digits = 5), "]"
+  )
+  all_preds$mz_value <- as.numeric(as.character(all_preds$MZ))
+  all_preds$qlabel <- cut(
+    all_preds$mz_value,
+    breaks = breaks,
+    labels = labels,
+    include.lowest = TRUE
+  )
+  qgroup <- levels(all_preds$qlabel)
+  lapply(seq_along(qgroup), function(qid) {
+    g_file_path <- file.path(
+      "~",
+      paste0(
+        exp_mode, "_calc_predictors_mz_",
+        groups[qid], ".pdf"
+      )
+    )
+    cairo_pdf(filename = g_file_path, width = 8, height = 20)
+    if (nrow(all_preds |> filter(qlabel == qgroup[qid])) > 0) {
+      print(ggplot(all_preds |> filter(qlabel == qgroup[qid])) +
+        labs(
+          title = paste("Predictors", qgroup[qid], "MZ")
+        ) +
+        facet_grid(. ~ data_set) +
+        geom_violin(aes(y = mz_fact, color = class, x = intensity)) +
+        labs(y = "MZ") +
+        theme_bw() +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+        ))
+    }
+    dev.off()
+  })
+})
+```
+
+### Downsampling full dataset
+
+```{r predshapqualcvdns, cache=FALSE}
+models_data_plot  <- lapply(
+  data_envs,
+  function(de) {
+    set.seed(202022026)
+    samples_cnt <- ifelse(
+      de$data_set_name == "Negative", 4500, 4000
+    )
+    if (file.exists(file.path(
+      "~",
+      paste0(de$data_set_name, "predshapfullcv_downsmpl.RData")))) {
+      load(file.path(
+        "~",
+        paste0(de$data_set_name, "predshapfullcv_downsmpl.RData")
+      ))
+      not_training_idx <- which(
+        all_meta_data$emsid %in% emsid_not_trained
+      )
+      pred_shap <- predict(
+        de$rf_model$finalModel,
+        de$all_fm_data$result_fm[-not_training_idx, ]
+      )
+      pos_idx <- which(pred_shap > 0)
+    } else {
+      tissues_data <- de$all_fm_data$result_meta_data |>
+        select(tissue, diagnosis) |>
+        distinct()
+      patients_data <- cbind(
+        tissues_data,
+        get_patient_info(tissues_data$tissue, conn)
+      )
+      patients_data <- patients_data |>
+        mutate(
+          emsid = as.factor(emsid),
+          sex = as.factor(sex),
+          age = if_else(is.na(age), -1, age)
+        )
+      all_meta_data <- left_join(
+        de$all_fm_data$result_meta_data,
+        patients_data |> select(-diagnosis),
+        by = "tissue"
+      )
+      patients_by_diags <- all_meta_data |>
+        select(emsid, diagnosis) |>
+        distinct()
+        # slice_sample(n = 4, by = diagnosis)
+      patients_by_diags <- patients_by_diags |>
+        mutate(
+          probs = n() / nrow(patients_by_diags),
+          .by = diagnosis
+        )
+      emsid_not_trained <- sample(
+        patients_by_diags$emsid, prob = patients_by_diags$probs, size = 8
+      )
+
+      not_training_idx <- which(
+        all_meta_data$emsid %in% emsid_not_trained
+      )
+      result_fm_df <- as.data.frame(
+        de$all_fm_data$result_fm[-not_training_idx, ]
+      )
+      names(result_fm_df) <- attributes(de$all_fm_data$result_fm)$mass
+      # pred_shap <- de$pred_shap[-not_training_idx, ]
+      pred_shap <- predict(
+        de$rf_model$finalModel,
+        de$all_fm_data$result_fm[-not_training_idx, ]
+      )
+      result_fm_df$class <- de$all_fm_data$result_meta_data[
+        -not_training_idx, "diagnosis"
+      ]
+      result_fm_df$group <- all_meta_data$emsid[
+        -not_training_idx
+      ]
+      result_fm_df$shapley <- pred_shap
+      train_groups <- sample(
+        unique(result_fm_df$group),
+        size = length(unique((result_fm_df$group))) * 0.75
+      )
+      train_idx <- which(result_fm_df$group %in% train_groups)
+      test_ds <- as.data.frame(de$all_fm_data$result_fm[not_training_idx, ])
+      names(test_ds) <- attributes(de$all_fm_data$result_fm)$mass
+      test_ds$class <- de$all_fm_data$result_meta_data[
+        not_training_idx, "diagnosis"
+      ]
+      pos_idx <- which(pred_shap > 0)
+      pos_ds <- result_fm_df[pos_idx, ]
+      samples_cnt <- min(
+        nrow(result_fm_df), nrow(pos_ds)
+      )
+      downsmpl_common_data <- train_validate_downsampling(
+        result_fm_df, test_ds,
+        downsmpl_length = samples_cnt
+      )
+      downsmpl_pos_data <- train_validate_downsampling(
+        pos_ds, test_ds,
+        downsmpl_length = samples_cnt
+      )
+    }
+    res_df <- data.frame(
+      annotation = c("All data", "Positive Shapley"),
+      acc = c(
+        downsmpl_common_data$summary[["acc"]],
+        downsmpl_pos_data$summary[["acc"]]
+      ),
+      se = c(
+        downsmpl_common_data$summary[["se"]],
+        downsmpl_pos_data$summary[["se"]]
+      ),
+      sp = c(
+        downsmpl_common_data$summary[["sp"]],
+        downsmpl_pos_data$summary[["sp"]]
+      ),
+      n_pred = c(
+        downsmpl_common_data$summary[["n_pred"]],
+        downsmpl_pos_data$summary[["n_pred"]]
+      ),
+      ROC = c(
+        downsmpl_common_data$summary[["ROC"]],
+        downsmpl_pos_data$summary[["ROC"]]
+      ),
+      NSR = c(
+        downsmpl_common_data$summary[["NSR"]],
+        downsmpl_pos_data$summary[["NSR"]]
+      ),
+      Samples = c(samples_cnt, samples_cnt),
+      Data = de$data_set_name
+    )
+    resampling_df <- rbind(
+      downsmpl_common_data$model_metrics |>
+        mutate(
+          annotation = "All data",
+          Data = de$data_set_name
+        ),
+      downsmpl_pos_data$model_metrics |>
+        mutate(
+          annotation = "Positive Shapley",
+          Data = de$data_set_name
+        )
+    )
+    common_resample <- reshape2::melt(
+      downsmpl_common_data$roc, variable.name = "Metric"
+    )
+    common_resample$name <- "All data"
+    pos_resample <- reshape2::melt(
+      downsmpl_pos_data$roc, variable.name = "Metric"
+    )
+    pos_resample$name <- "Positive Shapley"
+    all_resample <- bind_rows(common_resample, pos_resample)
+    all_resample$name <- factor(
+      all_resample$name,
+      levels = c("All data", "Positive Shapley")
+    )
+
+    p_roc <- rbind(
+      downsmpl_common_data$proc |>
+        mutate(
+          data_set = "All data",
+          exp_mode = de$data_set_name
+        ),
+      downsmpl_pos_data$proc |>
+        mutate(
+          data_set = "Positive Shapley",
+          exp_mode = de$data_set_name
+        )
+    )
+    p_roc$data_set <- factor(
+        p_roc$data_set,
+        levels = c("All data", "Positive Shapley")
+      )
+    all_preds <- rbind(
+      downsmpl_common_data$predictors |>
+        mutate(
+          data_set = "All data",
+          exp_mode = de$data_set_name
+        ),
+      downsmpl_pos_data$predictors |>
+        mutate(
+          data_set = "Positive Shapley",
+          exp_mode = de$data_set_name
+        )
+    )
+    all_preds$data_set <- factor(
+      all_preds$data_set,
+      levels = c("All data", "Positive Shapley")
+    )
+    all_preds <- all_preds |>
+        mutate(
+          max_int = max(intensity), .by = MZ
+        )
+      mu <- mean(all_preds$max_int)
+      sigma <- sd(all_preds$max_int)
+      all_preds$group <- cut(
+        all_preds$max_int,
+        breaks = c(-Inf, mu - sigma, mu, mu + sigma, Inf),
+        labels = c("VeryLow", "BelowMedian", "Median", "AboveMedian"),
+        include.lowest = TRUE
+      )
+    if (!file.exists(file.path(
+        "~",
+        paste0(de$data_set_name, "predshapfullcv_downsmpl.RData")))) {
+      save(
+        de, res_df, resampling_df, patients_by_diags,
+        p_roc, not_training_idx, all_meta_data,
+        patients_data, emsid_not_trained,
+        test_ds, downsmpl_common_data,
+        all_resample, result_fm_df, all_preds,
+        pos_ds, downsmpl_pos_data,
+          file = file.path(
+            "~",
+            paste0(de$data_set_name, "predshapfullcv_downsmpl.RData"))
+        )
+    }
+    list(
+      df = res_df,
+      plot_data = all_resample,
+      roc_plot = p_roc,
+      resampling_df = resampling_df,
+      all_preds = all_preds
+    )
+  }
+)
+models_data <- ldply(
+  models_data_plot,
+  function(mdp) mdp$df
+)
+kable(
+  models_data[, seq_len(ncol(models_data) - 1)],
+  format = "latex", caption = "Mean models quality",
+  row.names = FALSE, booktabs = TRUE,
+  col.names = c(
+    "Annotation", "Accuracy", "Sensitivity",
+    "Specificity", "NPreds", "ROC", "NSR", "Samples"
+  )
+) %>%
+  group_rows(index = table(models_data$Data)) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), font_size = 10)
+```
+
+```{r predshapplotmetricsdownsmpl, dev="cairo_pdf", fig.width=8, fig.align="center", cache=FALSE}
+resampling_data <- ldply(
+  models_data_plot,
+  function(mdp) mdp$resampling_df
+)
+plot_data <- reshape2::melt(
+  resampling_data |>
+    select(!c(ROC, n_pred, NSR)),
+  id.vars = c("Data", "annotation", "rep"),
+  variable.name = "Metric"
+)
+plot_data$annotation <- factor(
+  plot_data$annotation,
+  levels = c("All data", "Positive Shapley")
+)
+ggplot(
+  plot_data,
+  aes(value, annotation)
+) +
+  facet_grid(. ~ Metric, scales = "free_x") +
+  geom_boxplot(aes(color = Data), width = 0.4) +
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 15)) +
+  # Подписи
+  labs(
+    caption = "Metrics distribution (Full dataset)",
+    x = "Metric value",
+    y = NULL,
+    color = "Ions"
+  ) +
+  # Тема
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 10),
+    # strip.text = element_text(size = 12, face = "bold", color = "white"),
+    # strip.background = element_rect(fill = "#2c3e50", color = NA),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.spacing = unit(1, "lines")
+  )
+```
+
+```{r predshapplotmetricsdownsmpl2, dev="cairo_pdf", fig.width=8, fig.align="center", cache=FALSE}
+plot_data <- reshape2::melt(
+  resampling_data |>
+    select(!c(acc, se, sp)),
+  id.vars = c("Data", "annotation", "rep"),
+  variable.name = "Metric"
+)
+plot_data$annotation <- factor(
+  plot_data$annotation,
+  levels = c("All data", "Positive Shapley")
+)
+ggplot(
+  plot_data,
+  aes(value, annotation)
+) +
+  facet_grid(. ~ Metric, scales = "free_x") +
+  geom_boxplot(aes(color = Data), width = 0.4) +
+  scale_y_discrete(labels = function(x) stringr::str_wrap(x, width = 15)) +
+  # Подписи
+  labs(
+    caption = "ROC with NPreds distribution (Full dataset)",
+    x = "Metric value",
+    y = NULL,
+    color = "Ions"
+  ) +
+  # Тема
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 10),
+    # strip.text = element_text(size = 12, face = "bold", color = "white"),
+    # strip.background = element_rect(fill = "#2c3e50", color = NA),
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    axis.title.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.spacing = unit(1, "lines")
+  )
+```
+
+```{r predshapqualcvplotcommondns, dev="cairo_pdf", results="asis", fig.width=8, fig.align = "center", cache=FALSE}
+cv_plot_data <- ldply(models_data_plot, function(mdp) {
+  .data <- mdp$plot_data
+  .data$ds <- mdp$df$Data
+  .data
+})
+cv_plot_data$ds <- as.factor(cv_plot_data$ds)
+my_dotplot(
+  cv_plot_data,
+  paste0(
+    "Models 5-folds resampling metrics (Full dataset). ",
+    "Probability threshold: 0.5."
+  )
+)
+```
+
+```{r predshapqualcvrocplotdns, dev="cairo_pdf", fig.height=6, fig.width=8, fig.align = "center", cache=FALSE}
+roc_data <- ldply(models_data_plot, function(mdp) {
+  mdp$roc_plot
+})
+auc_labels <- roc_data |>
+  summarise(
+    max = max(auc),
+    min = min(auc),
+    mean = round(mean(auc), digits = 3),
+    sd = round(sd(auc), digits = 3), .by = c(exp_mode, data_set)
+  ) |>
+  mutate(
+      # Позиция для подписи (можно настроить)
+      x = 0.5,
+      y = 0.3
+  )
+roc_data$rep <- as.factor(roc_data$rep)
+data_tb <- tibble::tibble(
+  x = "right", y = "bottom",
+  tb = lapply(seq_len(nrow(auc_labels)), function(i) {
+    auc_labels[i, ] |> select(min, max, mean, sd)
+  }),
+  data_set = auc_labels$data_set,
+  exp_mode = auc_labels$exp_mode
+)
+ggplot(roc_data, aes(x = fpr, y = tpr, color = rep)) +
+  facet_grid(exp_mode ~ data_set, scales = "fixed") +
+  # ROC-кривая
+  geom_line() +
+  geom_abline(intercept = 0, slope = 1, 
+              linetype = "dashed", color = "gray40") +
+  geom_table_npc(
+    data = data_tb,
+    aes(npcx = x, npcy = y, label = tb),
+    parse = TRUE,
+    table.colnames = TRUE,
+    table.theme = ttheme_gtlight
+  ) +
+  scale_x_continuous(limits = c(0, 1), labels = scales::percent) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  coord_equal() +
+  labs(
+    caption = "Сравнение ROC-кривых (Full datast)",
+    x = "False Positive Rate",
+    y = "True Positive Rate",
+    color = "Датасет"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+roc_data <- lapply(models_data_plot, function(mdp) {
+  all_preds <- mdp$all_preds
+  all_preds$mz_fact <- factor(
+    all_preds$MZ, levels = sort(unique(levels(all_preds$MZ)))
+  )
+  exp_mode <- unique(all_preds$exp_mode)
+  groups <- levels(all_preds$group)
+  lapply(seq_along(groups), function(gid) {
+    g_file_path <- file.path(
+      "~",
+      paste0(
+        exp_mode, "_regr_predictors_",
+        groups[gid], ".pdf"
+      )
+    )
+    cairo_pdf(filename = g_file_path, width = 8, height = 20)
+    if (nrow(all_preds |> filter(group == groups[gid])) > 0) {
+      print(ggplot(all_preds |> filter(group == groups[gid])) +
+        labs(
+          title = paste("Predictors", groups[gid], "intens")
+        ) +
+        facet_grid(. ~ data_set) +
+        geom_violin(aes(y = mz_fact, color = class, x = intensity)) +
+        labs(y = "MZ") +
+        theme_bw() +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+        ))
+    }
+    dev.off()
+  })
+  breaks <- quantile(
+    as.numeric(levels(all_preds$MZ)), probs = seq(0, 1, length.out = 4)
+  )
+  labels <- paste0(
+    "(",
+    format(head(breaks, -1), digits = 5), ", ",
+    format(tail(breaks, -1), digits = 5), "]"
+  )
+  all_preds$mz_value <- as.numeric(as.character(all_preds$MZ))
+  all_preds$qlabel <- cut(
+    all_preds$mz_value,
+    breaks = breaks,
+    labels = labels,
+    include.lowest = TRUE
+  )
+  qgroup <- levels(all_preds$qlabel)
+  lapply(seq_along(qgroup), function(qid) {
+    g_file_path <- file.path(
+      "~",
+      paste0(
+        exp_mode, "_regr_predictors_mz_",
+        groups[qid], ".pdf"
+      )
+    )
+    cairo_pdf(filename = g_file_path, width = 8, height = 20)
+    if (nrow(all_preds |> filter(qlabel == qgroup[qid])) > 0) {
+      print(ggplot(all_preds |> filter(qlabel == qgroup[qid])) +
+        labs(
+          title = paste("Predictors", qgroup[qid], "MZ")
+        ) +
+        facet_grid(. ~ data_set) +
+        geom_violin(aes(y = mz_fact, color = class, x = intensity)) +
+        labs(y = "MZ") +
+        theme_bw() +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 14, face = "bold")
+        ))
+    }
+    dev.off()
+  })
+})
+```
+
+# Литература
+
+::: {#refs}
+:::
+
+# Appendix {.tabset}
+
+## Versions
+
+### Document version
+
+```{r docVersion, echo=FALSE, results='asis', cache=FALSE}
+cat(params$version)
+```
+
+### Session Info
+
+```{r sessionInfo, echo=FALSE, results='asis', class='text', warning=FALSE}
+pander(devtools::session_info()[[1]])
+cat("\n")
+pander(
+  as.data.frame(
+    devtools::session_info()[[2]][, c("loadedversion", "source", "date")]
+  )
+)
+```
